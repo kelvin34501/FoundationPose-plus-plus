@@ -17,3 +17,4 @@ pose_visualization/
 output_pose.npy
 testcase/
 lego_20fps/
+/tmp/

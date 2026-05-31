@@ -4,33 +4,6 @@ This document records the environment inferred from
 `shingarey/foundationpose_custom_cuda121:latest` and gives a conda-based setup
 for machines that cannot run Docker.
 
-## Docker Image Summary
-
-The Docker Hub image does not publish a source Dockerfile. Its image history
-shows the following environment:
-
-- Image: `shingarey/foundationpose_custom_cuda121:latest`
-- Last updated: `2024-04-09`
-- Digest: `sha256:288252092889a52a2e3f1c0087e4a380a601beedf54615c18312ab59cf1f3fb5`
-- OS: Ubuntu 20.04, `linux/amd64`
-- CUDA: 12.1.0 with CUDA development tools
-- Conda env: `/opt/conda/envs/my`
-- Python: 3.8
-- PyTorch stack:
-  - `torch==2.1.0+cu121`
-  - `torchvision==0.16.0+cu121`
-  - `torchaudio==2.1.0+cu121`
-- Native/source packages:
-  - `pybind11 v2.10.0`
-  - `Eigen 3.4.0`
-  - `pytorch3d` from `facebookresearch/pytorch3d@stable`
-  - `kaolin` from `NVIDIAGameWorks/kaolin`
-  - `nvdiffrast` from `NVlabs/nvdiffrast`
-
-Note: `FoundationPose/requirements.txt` currently pins `torch==2.4.1` and
-`torchvision==0.19.1`. That is not the Docker image environment. If the goal is
-to reproduce the Docker image, use the PyTorch 2.1.0 CUDA 12.1 stack below.
-
 ## System Requirements
 
 Recommended host requirements:
@@ -62,7 +35,7 @@ Qt package is needed.
 ## Create Conda Environment
 
 ```bash
-conda create -n foundationposepp python=3.8 -y
+conda create -n foundationposepp python=3.9 pip=24.0 -y
 conda activate foundationposepp
 
 # disabled: use system provide
@@ -73,9 +46,9 @@ conda activate foundationposepp
 # Provides nvcc and CUDA headers inside the conda environment.
 # conda install -y -c nvidia cuda-toolkit=12.1
 
-export CUDA_HOME=$CONDA_PREFIX
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+# export CUDA_HOME=$CONDA_PREFIX
+# export PATH=$CUDA_HOME/bin:$PATH
+# export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 ```
 
 It is useful to persist these variables after the environment is verified:
@@ -93,9 +66,8 @@ Use the versions from the Docker image:
 
 ```bash
 pip install \
-  torch==2.1.0+cu121 \
-  torchvision==0.16.0+cu121 \
-  torchaudio==2.1.0+cu121 \
+  torch==2.4.1+cu121 \
+  torchvision==0.19.1+cu121 \
   --index-url https://download.pytorch.org/whl/cu121
 ```
 
@@ -115,7 +87,7 @@ PY
 From the repository root:
 
 ```bash
-export PROJECT_ROOT=/mnt/homes/xinyu-ldap/teleop_platform_ws/teleop_platform_realman/ext/FoundationPose-plus-plus
+export PROJECT_ROOT=$HOME/teleop_platform_ws/teleop_platform_realman/ext/FoundationPose-plus-plus
 cd $PROJECT_ROOT/FoundationPose
 ```
 
@@ -123,7 +95,7 @@ Install the Python dependencies. Keep the PyTorch packages already installed
 above:
 
 ```bash
-pip install -r requirements.txt --no-deps
+pip install -r requirements.txt
 
 pip install \
   numpy==1.26.4 scipy==1.12.0 scikit-learn==1.4.1.post1 \
@@ -151,7 +123,7 @@ pip install "git+https://github.com/NVlabs/nvdiffrast.git"
 
 git clone --recursive https://github.com/NVIDIAGameWorks/kaolin /tmp/kaolin
 cd /tmp/kaolin
-FORCE_CUDA=1 pip install -e .
+FORCE_CUDA=1 pip install .
 ```
 
 If a compile step cannot find CUDA, check:

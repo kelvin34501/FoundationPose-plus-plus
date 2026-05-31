@@ -402,7 +402,7 @@ class ObjectPoseServer:
         if not self.sam_api_endpoint:
             return None
 
-        tmp_dir = "/tmp/object_pose_server"
+        tmp_dir = os.path.join(THIS_DIR, "tmp", "object_pose_server")
         os.makedirs(tmp_dir, exist_ok=True)
         frame_path = os.path.join(tmp_dir, "sam_frame.png")
         mask_path = os.path.join(tmp_dir, "sam_mask.png")
