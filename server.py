@@ -15,10 +15,14 @@ import logging
 import os
 import pickle
 import signal
+import socket
+import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -146,6 +150,60 @@ def get_mat_from_6d_pose_arr(pose_arr: np.ndarray) -> np.ndarray:
     return T
 
 
+def run_with_cpu_default_tensor_type(fn):
+    """Run code that loads CPU checkpoints after FoundationPose sets CUDA defaults."""
+    try:
+        was_cuda_default = torch.Tensor().device.type == "cuda"
+    except Exception:
+        was_cuda_default = False
+
+    torch.set_default_tensor_type(torch.FloatTensor)
+    try:
+        return fn()
+    finally:
+        if was_cuda_default:
+            torch.set_default_tensor_type(torch.cuda.FloatTensor)
+
+
+def clear_hydra_if_initialized() -> None:
+    try:
+        from hydra.core.global_hydra import GlobalHydra
+
+        hydra = GlobalHydra.instance()
+        if hydra.is_initialized():
+            hydra.clear()
+    except ImportError:
+        return
+
+
+def draw_pose_frame_bgr(
+    image_bgr: np.ndarray,
+    T_camera_object: np.ndarray,
+    K: np.ndarray,
+    axis_scale: float,
+    thickness: int = 3,
+) -> np.ndarray:
+    points_obj = np.asarray(
+        [
+            [0.0, 0.0, 0.0, 1.0],
+            [axis_scale, 0.0, 0.0, 1.0],
+            [0.0, axis_scale, 0.0, 1.0],
+            [0.0, 0.0, axis_scale, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    points_cam = (np.asarray(T_camera_object, dtype=np.float64) @ points_obj.T).T[:, :3]
+    if np.any(points_cam[:, 2] <= 1e-6):
+        return image_bgr
+    uv = (np.asarray(K, dtype=np.float64) @ points_cam.T).T
+    uv = np.round(uv[:, :2] / uv[:, 2:3]).astype(int)
+    origin = tuple(uv[0].tolist())
+    cv2.arrowedLine(image_bgr, origin, tuple(uv[1].tolist()), (0, 0, 255), thickness, cv2.LINE_AA, tipLength=0.08)
+    cv2.arrowedLine(image_bgr, origin, tuple(uv[2].tolist()), (0, 255, 0), thickness, cv2.LINE_AA, tipLength=0.08)
+    cv2.arrowedLine(image_bgr, origin, tuple(uv[3].tolist()), (255, 0, 0), thickness, cv2.LINE_AA, tipLength=0.08)
+    return image_bgr
+
+
 @dataclass
 class SyncFrame:
     sync_timestamp: float
@@ -178,6 +236,7 @@ class ObjectState:
     kf_mean: Optional[np.ndarray] = None
     kf_covariance: Optional[np.ndarray] = None
     init_mask: Optional[np.ndarray] = None
+    last_T_camera_object: Optional[np.ndarray] = None
     last_T_world_object: Optional[np.ndarray] = None
     last_score: Optional[float] = None
     error_msg: Optional[str] = None
@@ -196,6 +255,7 @@ class ObjectState:
         self.kf_mean = None
         self.kf_covariance = None
         self.init_mask = None
+        self.last_T_camera_object = None
         self.last_T_world_object = None
         self.last_score = None
         self.error_msg = None
@@ -264,6 +324,11 @@ class ObjectPoseServer:
         activate_kalman_filter: bool,
         kf_measurement_noise_scale: float,
         sam_api_endpoint: Optional[str],
+        sam_api_autostart: bool,
+        sam_api_script: Optional[str],
+        sam_api_checkpoint_path: Optional[str],
+        sam_api_model_type: str,
+        sam_api_startup_timeout: float,
         display_scale: float,
         debug: int,
     ):
@@ -279,6 +344,11 @@ class ObjectPoseServer:
         self.activate_kalman_filter = activate_kalman_filter
         self.kf_measurement_noise_scale = kf_measurement_noise_scale
         self.sam_api_endpoint = sam_api_endpoint
+        self.sam_api_autostart = sam_api_autostart
+        self.sam_api_script = sam_api_script
+        self.sam_api_checkpoint_path = sam_api_checkpoint_path
+        self.sam_api_model_type = sam_api_model_type
+        self.sam_api_startup_timeout = sam_api_startup_timeout
         self.display_scale = display_scale
         self.debug = debug
 
@@ -287,6 +357,7 @@ class ObjectPoseServer:
         self.latest_frame: Optional[SyncFrame] = None
         self.shutdown = False
         self.factory: Optional[FoundationPoseFactory] = None
+        self.sam_api_process: Optional[subprocess.Popen] = None
         self._closed = False
 
         self.cam_intr_map = self._load_calib("cam_intr")
@@ -311,6 +382,8 @@ class ObjectPoseServer:
         self.poller = zmq.Poller()
         self.poller.register(self.sync_socket, zmq.POLLIN)
 
+        self._maybe_start_sam_api()
+
     def _load_calib(self, kind: str) -> Dict[str, np.ndarray]:
         result: Dict[str, np.ndarray] = {}
         for camera_name in self.camera_name_list:
@@ -329,6 +402,89 @@ class ObjectPoseServer:
         self.sync_socket.close(linger=0)
         self.pub_socket.close(linger=0)
         self.ctx.term()
+        self._stop_sam_api()
+
+    def _parse_sam_api_endpoint(self) -> Optional[Tuple[str, int]]:
+        if not self.sam_api_endpoint:
+            return None
+        parsed = urllib.parse.urlparse(self.sam_api_endpoint)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            _logger.warning("SAM-HQ autostart only supports http(s) endpoints, got %s", self.sam_api_endpoint)
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return parsed.hostname, port
+
+    def _sam_api_port_open(self, host: str, port: int, timeout: float = 0.2) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def _maybe_start_sam_api(self) -> None:
+        if not self.sam_api_autostart:
+            return
+
+        endpoint = self._parse_sam_api_endpoint()
+        if endpoint is None:
+            return
+        host, port = endpoint
+        if host not in ("127.0.0.1", "localhost"):
+            _logger.warning("SAM-HQ autostart only starts local endpoints, got host=%s", host)
+            return
+        if self._sam_api_port_open(host, port):
+            _logger.info("SAM-HQ API already reachable at %s", self.sam_api_endpoint)
+            return
+
+        script = os.path.abspath(os.path.expanduser(self.sam_api_script or ""))
+        checkpoint_path = os.path.abspath(os.path.expanduser(self.sam_api_checkpoint_path or ""))
+        if not os.path.exists(script):
+            raise FileNotFoundError(f"SAM-HQ API script not found: {script}")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"SAM-HQ checkpoint not found: {checkpoint_path}")
+
+        cmd = [
+            sys.executable,
+            script,
+            "--checkpoint_path",
+            checkpoint_path,
+            "--model_type",
+            self.sam_api_model_type,
+            "--port",
+            str(port),
+        ]
+        _logger.info("Starting SAM-HQ API: %s", " ".join(cmd))
+        self.sam_api_process = subprocess.Popen(
+            cmd,
+            cwd=THIS_DIR,
+            start_new_session=True,
+        )
+
+        deadline = time.time() + self.sam_api_startup_timeout
+        while time.time() < deadline:
+            if self.sam_api_process.poll() is not None:
+                raise RuntimeError(f"SAM-HQ API exited early with code {self.sam_api_process.returncode}")
+            if self._sam_api_port_open(host, port):
+                _logger.info("SAM-HQ API is ready at %s", self.sam_api_endpoint)
+                return
+            time.sleep(0.25)
+
+        self._stop_sam_api()
+        raise TimeoutError(f"Timed out waiting for SAM-HQ API at {self.sam_api_endpoint}")
+
+    def _stop_sam_api(self) -> None:
+        process = self.sam_api_process
+        self.sam_api_process = None
+        if process is None or process.poll() is not None:
+            return
+        _logger.info("Stopping SAM-HQ API process pid=%s", process.pid)
+        process.terminate()
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            _logger.warning("SAM-HQ API did not exit after terminate; killing pid=%s", process.pid)
+            process.kill()
+            process.wait(timeout=5.0)
 
     def _decode_sync_message(self, msg: bytes) -> Optional[SyncFrame]:
         data = msgpack.unpackb(msg, object_hook=msgpack_numpy.decode, raw=False)
@@ -386,26 +542,24 @@ class ObjectPoseServer:
     def _read_mask_override(self, state: ObjectState, shape: Tuple[int, int]) -> Optional[np.ndarray]:
         mask_path = state.spec.mask_path
         if not mask_path:
-            raw = input("Optional mask path to import/replace generated mask [Enter to skip]: ").strip()
-            mask_path = raw or None
-        if not mask_path:
             return None
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if mask is None:
-            _logger.warning("Could not read mask path %s; falling back to bbox/SAM mask", mask_path)
-            return None
+            raise FileNotFoundError(f"Could not read configured mask_path for {state.spec.object_id}: {mask_path}")
         if mask.shape != shape:
             mask = cv2.resize(mask, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
         return (mask > 0).astype(np.uint8)
 
     def _request_sam_mask(self, frame_rgb: np.ndarray, bbox_xywh: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
         if not self.sam_api_endpoint:
+            _logger.warning("SAM-HQ API endpoint is not configured; cannot initialize from bbox prompt")
             return None
 
         tmp_dir = os.path.join(THIS_DIR, "tmp", "object_pose_server")
         os.makedirs(tmp_dir, exist_ok=True)
-        frame_path = os.path.join(tmp_dir, "sam_frame.png")
-        mask_path = os.path.join(tmp_dir, "sam_mask.png")
+        token = f"{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        frame_path = os.path.join(tmp_dir, f"sam_frame_{token}.png")
+        mask_path = os.path.join(tmp_dir, f"sam_mask_{token}.png")
         cv2.imwrite(frame_path, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
         payload = json.dumps({
             "frame_path": frame_path,
@@ -433,19 +587,100 @@ class ObjectPoseServer:
             return None
         return (mask > 0).astype(np.uint8)
 
-    def _build_bbox_mask(
+    def _select_bbox(
         self,
         frame_rgb: np.ndarray,
+        object_id: str,
+        camera_name: str,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        window = f"init:{object_id}:{camera_name}"
+        display = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        if self.display_scale != 1.0:
+            display = cv2.resize(display, None, fx=self.display_scale, fy=self.display_scale)
+        cv2.imshow(window, display)
+        cv2.waitKey(1)
+
+        print(f"\nInitializing object: {object_id}")
+        print("Draw bbox and press Enter/Space. Press c to cancel.")
+        roi = cv2.selectROI(window, display, showCrosshair=True, fromCenter=False)
+        cv2.destroyWindow(window)
+        if roi[2] <= 0 or roi[3] <= 0:
+            return None
+
+        scale = self.display_scale if self.display_scale != 0 else 1.0
+        x, y, w, h = (int(round(v / scale)) for v in roi)
+        height, width = frame_rgb.shape[:2]
+        x1 = max(0, min(width - 1, x))
+        y1 = max(0, min(height - 1, y))
+        x2 = max(x1, min(width, x + max(0, w)))
+        y2 = max(y1, min(height, y + max(0, h)))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2 - x1, y2 - y1
+
+    def _validate_init_mask(
+        self,
+        state: ObjectState,
+        mask: np.ndarray,
+        shape: Tuple[int, int],
+    ) -> Optional[str]:
+        if mask.ndim != 2:
+            return f"Init mask must be 2D, got shape {mask.shape}"
+        if mask.shape != shape:
+            return f"Init mask shape {mask.shape} does not match RGB frame shape {shape}"
+        area = int((mask > 0).sum())
+        image_area = int(shape[0] * shape[1])
+        if area < 16:
+            return "Init mask has fewer than 16 foreground pixels"
+        if area > int(image_area * 0.95):
+            return "Init mask covers more than 95% of the frame"
+        state.meta["init_mask_area"] = area
+        return None
+
+    def _confirm_init_mask(
+        self,
+        frame_rgb: np.ndarray,
+        mask: np.ndarray,
         bbox_xywh: Tuple[int, int, int, int],
-    ) -> np.ndarray:
+        object_id: str,
+        camera_name: str,
+    ) -> str:
+        overlay = frame_rgb.copy()
+        mask_bool = mask.astype(bool)
+        mask_color = np.asarray([0, 255, 0], dtype=np.uint8)
+        overlay[mask_bool] = (0.55 * overlay[mask_bool] + 0.45 * mask_color).astype(np.uint8)
+
+        disp = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
         x, y, w, h = bbox_xywh
-        mask = np.zeros(frame_rgb.shape[:2], dtype=np.uint8)
-        x1 = max(0, int(x))
-        y1 = max(0, int(y))
-        x2 = min(mask.shape[1], x1 + max(0, int(w)))
-        y2 = min(mask.shape[0], y1 + max(0, int(h)))
-        mask[y1:y2, x1:x2] = 1
-        return mask
+        cv2.rectangle(disp, (x, y), (x + w, y + h), (0, 220, 255), 2)
+        cv2.putText(
+            disp,
+            "Enter/Space: accept  r: redraw bbox  q/Esc: cancel",
+            (10, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
+        window = f"mask:{object_id}:{camera_name}"
+        if self.display_scale != 1.0:
+            disp = cv2.resize(disp, None, fx=self.display_scale, fy=self.display_scale)
+        cv2.imshow(window, disp)
+
+        while True:
+            key = cv2.waitKey(0)
+            if key < 0:
+                continue
+            key &= 0xFF
+            if key in (13, 10, 32):
+                cv2.destroyWindow(window)
+                return "accept"
+            if key == ord("r"):
+                cv2.destroyWindow(window)
+                return "redraw"
+            if key == ord("q") or key == 27:
+                cv2.destroyWindow(window)
+                return "cancel"
 
     def _init_object(self, state: ObjectState, frame: SyncFrame) -> bool:
         state.meta["init_attempted"] = True
@@ -462,34 +697,45 @@ class ObjectPoseServer:
 
         color = frame.color_by_camera[camera_name]
         depth = frame.depth_by_camera[camera_name]
-        window = f"init:{state.spec.object_id}:{camera_name}"
-        display = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
-        if self.display_scale != 1.0:
-            display = cv2.resize(display, None, fx=self.display_scale, fy=self.display_scale)
-        cv2.imshow(window, display)
-        cv2.waitKey(1)
+        mask_source = "sam_hq"
+        while True:
+            bbox_xywh = self._select_bbox(color, state.spec.object_id, camera_name)
+            if bbox_xywh is None:
+                state.meta["init_cancelled"] = True
+                state.error_msg = "Initialization cancelled"
+                _logger.info("Initialization cancelled for %s", state.spec.object_id)
+                return False
 
-        print(f"\nInitializing object: {state.spec.object_id}")
-        print("Draw bbox and press Enter/Space. Press c to cancel.")
-        roi = cv2.selectROI(window, display, showCrosshair=True, fromCenter=False)
-        cv2.destroyWindow(window)
-        if roi[2] <= 0 or roi[3] <= 0:
+            try:
+                mask = self._read_mask_override(state, color.shape[:2])
+            except Exception as exc:
+                state.error_msg = str(exc)
+                _logger.error("%s: %s", state.spec.object_id, state.error_msg)
+                return False
+            if mask is None:
+                mask = self._request_sam_mask(color, bbox_xywh)
+                mask_source = "sam_hq"
+            else:
+                mask_source = "mask_path"
+            if mask is None:
+                state.error_msg = "SAM-HQ did not return a usable init mask"
+                _logger.error("%s: %s", state.spec.object_id, state.error_msg)
+                return False
+
+            mask_error = self._validate_init_mask(state, mask, color.shape[:2])
+            if mask_error is not None:
+                state.error_msg = mask_error
+                _logger.error("%s: %s", state.spec.object_id, state.error_msg)
+                return False
+
+            confirm = self._confirm_init_mask(color, mask, bbox_xywh, state.spec.object_id, camera_name)
+            if confirm == "accept":
+                break
+            if confirm == "redraw":
+                continue
             state.meta["init_cancelled"] = True
             state.error_msg = "Initialization cancelled"
             _logger.info("Initialization cancelled for %s", state.spec.object_id)
-            return False
-
-        scale = self.display_scale if self.display_scale != 0 else 1.0
-        bbox_xywh = tuple(int(round(v / scale)) for v in roi)
-        mask = self._read_mask_override(state, color.shape[:2])
-        if mask is None:
-            mask = self._request_sam_mask(color, bbox_xywh)
-        if mask is None:
-            mask = self._build_bbox_mask(color, bbox_xywh)
-
-        if mask.sum() < 4:
-            state.error_msg = "Init mask has fewer than 4 pixels"
-            _logger.error("%s: %s", state.spec.object_id, state.error_msg)
             return False
 
         try:
@@ -507,16 +753,29 @@ class ObjectPoseServer:
             )
             state.source_camera = camera_name
             state.init_mask = mask
-            state.tracker_2d = Cutie() if self.activate_2d_tracker else Tracker_2D()
             if self.activate_2d_tracker:
-                state.tracker_2d.initialize(color, init_info={"mask": mask})
+                def _init_cutie_tracker():
+                    clear_hydra_if_initialized()
+                    tracker = Cutie()
+                    tracker.initialize(color, init_info={"mask": mask})
+                    return tracker
+
+                state.tracker_2d = run_with_cpu_default_tensor_type(_init_cutie_tracker)
+            else:
+                state.tracker_2d = Tracker_2D()
             if self.activate_kalman_filter:
                 state.kalman_filter = KalmanFilter6D(self.kf_measurement_noise_scale)
                 state.kf_mean, state.kf_covariance = state.kalman_filter.initiate(get_6d_pose_arr_from_mat(pose_cam))
+            state.last_T_camera_object = np.asarray(pose_cam, dtype=np.float64)
             state.last_T_world_object = inv_transf_np(self.cam_extr_map[camera_name]) @ pose_cam
             state.state = "tracking"
             state.error_msg = None
-            state.meta = {"init_bbox_xywh": bbox_xywh, "init_sync_timestamp": frame.sync_timestamp}
+            state.meta = {
+                "init_bbox_xywh": bbox_xywh,
+                "init_mask_area": int((mask > 0).sum()),
+                "init_mask_source": mask_source,
+                "init_sync_timestamp": frame.sync_timestamp,
+            }
             _logger.info("Initialized %s from %s", state.spec.object_id, camera_name)
             return True
         except Exception as exc:
@@ -577,6 +836,7 @@ class ObjectPoseServer:
                     state.kf_mean,
                     state.kf_covariance,
                 )
+            state.last_T_camera_object = np.asarray(pose_cam, dtype=np.float64)
             state.last_T_world_object = inv_transf_np(self.cam_extr_map[camera_name]) @ pose_cam
             state.state = "tracking"
             state.error_msg = None
@@ -621,6 +881,21 @@ class ObjectPoseServer:
             img = next(iter(frame.color_by_camera.values()))
             camera_name = next(iter(frame.color_by_camera.keys()))
         disp = cv2.cvtColor(img.copy(), cv2.COLOR_RGB2BGR)
+        cam_K = self.cam_intr_map.get(camera_name)
+        if cam_K is not None:
+            for i, state in enumerate(self.object_states):
+                if state.source_camera != camera_name or state.last_T_camera_object is None or not state.valid:
+                    continue
+                axis_scale = 0.08
+                if state.mesh is not None:
+                    axis_scale = float(np.clip(state.mesh.extents.max() * 0.35, 0.03, 0.20))
+                disp = draw_pose_frame_bgr(
+                    disp,
+                    state.last_T_camera_object,
+                    cam_K,
+                    axis_scale=axis_scale,
+                    thickness=4 if i == self.current_object_idx else 2,
+                )
         y = 24
         cv2.putText(disp, f"camera={camera_name} sync={frame.sync_timestamp:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (255, 255, 255), 2)
@@ -743,6 +1018,19 @@ def main() -> None:
     parser.add_argument("--activate_kalman_filter", action="store_true")
     parser.add_argument("--kf_measurement_noise_scale", type=float, default=0.05)
     parser.add_argument("--sam_api_endpoint", type=str, default=None)
+    parser.add_argument("--sam_api_autostart", action="store_true")
+    parser.add_argument(
+        "--sam_api_script",
+        type=str,
+        default=os.path.join(THIS_DIR, "src", "WebAPI", "hq_sam_api_alt.py"),
+    )
+    parser.add_argument(
+        "--sam_api_checkpoint_path",
+        type=str,
+        default=os.path.join(THIS_DIR, "sam-hq", "pretrained_checkpoints", "sam_hq_vit_l.pth"),
+    )
+    parser.add_argument("--sam_api_model_type", type=str, default="vit_l")
+    parser.add_argument("--sam_api_startup_timeout", type=float, default=120.0)
     parser.add_argument("--display_scale", type=float, default=0.75)
     parser.add_argument("--debug", type=int, default=0)
     args = parser.parse_args()
@@ -761,6 +1049,11 @@ def main() -> None:
         activate_kalman_filter=args.activate_kalman_filter,
         kf_measurement_noise_scale=args.kf_measurement_noise_scale,
         sam_api_endpoint=args.sam_api_endpoint,
+        sam_api_autostart=args.sam_api_autostart,
+        sam_api_script=os.path.abspath(os.path.expanduser(args.sam_api_script)),
+        sam_api_checkpoint_path=os.path.abspath(os.path.expanduser(args.sam_api_checkpoint_path)),
+        sam_api_model_type=args.sam_api_model_type,
+        sam_api_startup_timeout=args.sam_api_startup_timeout,
         display_scale=args.display_scale,
         debug=args.debug,
     )
