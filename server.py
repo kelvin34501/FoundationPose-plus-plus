@@ -58,6 +58,28 @@ from utils.kalman_filter_6d import KalmanFilter6D  # noqa: E402
 _logger = logging.getLogger("object_pose_server")
 
 
+class ThrottleFilter(logging.Filter):
+    """同一 (logger, level, msg) 在 *throttle_seconds* 内只放行一次。
+
+    WARNING 及以上级别永远放行，不节流。
+    """
+
+    def __init__(self, throttle_seconds: float = 1.0):
+        super().__init__()
+        self._throttle = throttle_seconds
+        self._last: Dict[tuple, float] = {}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        key = (record.name, record.levelno, record.getMessage())
+        now = time.time()
+        if now - self._last.get(key, 0) < self._throttle:
+            return False
+        self._last[key] = now
+        return True
+
+
 def channel_name_to_endpoint(channel_name: str, ipc_prefix: str = "/dev/shm/hcc_demo") -> str:
     endpoint = channel_name
     if not endpoint.startswith("ipc://") and not endpoint.startswith("tcp://"):
@@ -756,6 +778,7 @@ class ObjectPoseServer:
             state.source_camera = camera_name
             state.init_mask = mask
             if self.activate_2d_tracker:
+
                 def _init_cutie_tracker():
                     clear_hydra_if_initialized()
                     tracker = Cutie()
@@ -766,8 +789,7 @@ class ObjectPoseServer:
             else:
                 state.tracker_2d = Tracker_2D()
             # Capture the init mask from Cutie for visualization overlay
-            if (hasattr(state.tracker_2d, 'last_mask')
-                    and state.tracker_2d.last_mask is not None):
+            if (hasattr(state.tracker_2d, 'last_mask') and state.tracker_2d.last_mask is not None):
                 state.last_mask = state.tracker_2d.last_mask.copy()
             if self.activate_kalman_filter:
                 state.kalman_filter = KalmanFilter6D(self.kf_measurement_noise_scale)
@@ -894,9 +916,9 @@ class ObjectPoseServer:
 
         # --- Overlay tracking masks (semi-transparent + contour) ---
         _MASK_COLORS_BGR = [
-            (0, 255, 0),    # green
-            (255, 0, 0),    # blue
-            (0, 0, 255),    # red
+            (0, 255, 0),  # green
+            (255, 0, 0),  # blue
+            (0, 0, 255),  # red
             (0, 255, 255),  # yellow
             (255, 0, 255),  # magenta
             (255, 255, 0),  # cyan
@@ -915,8 +937,7 @@ class ObjectPoseServer:
             overlay[mask_bool] = obj_color
             disp = cv2.addWeighted(disp, 0.65, overlay, 0.35, 0)
             # Contour outline
-            contours, _ = cv2.findContours(
-                state.last_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(state.last_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(disp, contours, -1, obj_color, 2, cv2.LINE_AA)
 
         # --- Draw pose axes ---
@@ -1043,6 +1064,8 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    logging.getLogger().addFilter(ThrottleFilter(throttle_seconds=1.0))
+
     parser = argparse.ArgumentParser(description="Interactive Object Pose Estimation Server")
     parser.add_argument("--server.video_shape", type=parse_video_shape, default="1280x720")
     parser.add_argument("--server.sync_channel", type=str, required=True)
