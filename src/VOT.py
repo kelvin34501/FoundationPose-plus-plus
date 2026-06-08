@@ -20,7 +20,7 @@ if cutie_path not in sys.path:
 
 class Tracker_2D:
     def __init__(self):
-        pass
+        self.last_mask: np.ndarray = None
 
     def initialize(
             self, 
@@ -29,6 +29,7 @@ class Tracker_2D:
             mask_visualization_path: str = None,
             bbox_visualization_path: str = None,
     ):
+        self.last_mask = None
         return [-1, -1, 0, 0]
 
     def track(
@@ -37,6 +38,7 @@ class Tracker_2D:
             mask_visualization_path: str = None,
             bbox_visualization_path: str = None,
     ):
+        self.last_mask = None
         return [-1, -1, 0, 0]
 
 
@@ -49,6 +51,7 @@ class Cutie(Tracker_2D):
         super().__init__()
         self.cutie_seg_threshold = cutie_seg_threshold
         self.erosion_size = erosion_size
+        self.last_mask: np.ndarray = None
 
         from cutie.inference.inference_core import InferenceCore
         from cutie.utils.get_default_model import get_default_model
@@ -80,6 +83,9 @@ class Cutie(Tracker_2D):
 
             mask_np = mask.cpu().numpy()
 
+        # Save raw mask (before erosion) for external visualization
+        self.last_mask = mask_np.astype(np.uint8)
+
         bbox_xywh = self._parse_output(mask_np)
 
         init_frame = init_frame.copy()
@@ -108,6 +114,9 @@ class Cutie(Tracker_2D):
             mask = self.cutie_processor.output_prob_to_mask(output_prob, segment_threshold=self.cutie_seg_threshold)
 
             mask_np = mask.cpu().numpy()
+
+        # Save raw mask (before erosion) for external visualization
+        self.last_mask = mask_np.astype(np.uint8)
             
         bbox_xywh = self._parse_output(mask_np)
 

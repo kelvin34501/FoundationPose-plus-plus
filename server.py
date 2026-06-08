@@ -236,6 +236,7 @@ class ObjectState:
     kf_mean: Optional[np.ndarray] = None
     kf_covariance: Optional[np.ndarray] = None
     init_mask: Optional[np.ndarray] = None
+    last_mask: Optional[np.ndarray] = None
     last_T_camera_object: Optional[np.ndarray] = None
     last_T_world_object: Optional[np.ndarray] = None
     last_score: Optional[float] = None
@@ -255,6 +256,7 @@ class ObjectState:
         self.kf_mean = None
         self.kf_covariance = None
         self.init_mask = None
+        self.last_mask = None
         self.last_T_camera_object = None
         self.last_T_world_object = None
         self.last_score = None
@@ -763,6 +765,10 @@ class ObjectPoseServer:
                 state.tracker_2d = run_with_cpu_default_tensor_type(_init_cutie_tracker)
             else:
                 state.tracker_2d = Tracker_2D()
+            # Capture the init mask from Cutie for visualization overlay
+            if (hasattr(state.tracker_2d, 'last_mask')
+                    and state.tracker_2d.last_mask is not None):
+                state.last_mask = state.tracker_2d.last_mask.copy()
             if self.activate_kalman_filter:
                 state.kalman_filter = KalmanFilter6D(self.kf_measurement_noise_scale)
                 state.kf_mean, state.kf_covariance = state.kalman_filter.initiate(get_6d_pose_arr_from_mat(pose_cam))
@@ -799,6 +805,9 @@ class ObjectPoseServer:
             cam_K = self.cam_intr_map[camera_name]
             if self.activate_2d_tracker and state.tracker_2d is not None:
                 bbox = state.tracker_2d.track(color)
+                # Collect the tracking mask for visualization
+                if hasattr(state.tracker_2d, 'last_mask') and state.tracker_2d.last_mask is not None:
+                    state.last_mask = state.tracker_2d.last_mask.copy()
                 if bbox[0] >= 0 and bbox[1] >= 0 and state.estimator.pose_last is not None:
                     cx = bbox[0] + bbox[2] / 2.0
                     cy = bbox[1] + bbox[3] / 2.0
@@ -882,6 +891,35 @@ class ObjectPoseServer:
             camera_name = next(iter(frame.color_by_camera.keys()))
         disp = cv2.cvtColor(img.copy(), cv2.COLOR_RGB2BGR)
         cam_K = self.cam_intr_map.get(camera_name)
+
+        # --- Overlay tracking masks (semi-transparent + contour) ---
+        _MASK_COLORS_BGR = [
+            (0, 255, 0),    # green
+            (255, 0, 0),    # blue
+            (0, 0, 255),    # red
+            (0, 255, 255),  # yellow
+            (255, 0, 255),  # magenta
+            (255, 255, 0),  # cyan
+        ]
+        for i, state in enumerate(self.object_states):
+            if state.source_camera != camera_name:
+                continue
+            if state.last_mask is None:
+                continue
+            if state.last_mask.shape[:2] != disp.shape[:2]:
+                continue
+            obj_color = _MASK_COLORS_BGR[i % len(_MASK_COLORS_BGR)]
+            mask_bool = state.last_mask > 0
+            # Semi-transparent fill
+            overlay = disp.copy()
+            overlay[mask_bool] = obj_color
+            disp = cv2.addWeighted(disp, 0.65, overlay, 0.35, 0)
+            # Contour outline
+            contours, _ = cv2.findContours(
+                state.last_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(disp, contours, -1, obj_color, 2, cv2.LINE_AA)
+
+        # --- Draw pose axes ---
         if cam_K is not None:
             for i, state in enumerate(self.object_states):
                 if state.source_camera != camera_name or state.last_T_camera_object is None or not state.valid:
