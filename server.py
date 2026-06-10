@@ -231,6 +231,37 @@ class SyncFrame:
     sync_timestamp: float
     color_by_camera: Dict[str, np.ndarray]
     depth_by_camera: Dict[str, np.ndarray]
+    cam_intr_by_camera: Dict[str, np.ndarray]
+
+
+def resize_frame_and_intrinsics(
+    color: np.ndarray,
+    depth: Optional[np.ndarray],
+    cam_K: np.ndarray,
+    target_height: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+    if target_height == -1:
+        return color, depth, np.asarray(cam_K, dtype=np.float64)
+    if target_height <= 0:
+        raise ValueError(f"target_height must be -1 or a positive integer, got {target_height}")
+
+    height, width = color.shape[:2]
+    if height <= target_height:
+        return color, depth, np.asarray(cam_K, dtype=np.float64)
+
+    scale = float(target_height) / float(height)
+    target_width = max(1, int(round(width * scale)))
+    resized_color = cv2.resize(color, (target_width, target_height), interpolation=cv2.INTER_AREA)
+    resized_depth = None
+    if depth is not None:
+        resized_depth = cv2.resize(depth, (target_width, target_height), interpolation=cv2.INTER_NEAREST)
+
+    resized_K = np.asarray(cam_K, dtype=np.float64).copy()
+    resized_K[0, 0] *= scale
+    resized_K[1, 1] *= scale
+    resized_K[0, 2] *= scale
+    resized_K[1, 2] *= scale
+    return resized_color, resized_depth, resized_K
 
 
 @dataclass
@@ -344,6 +375,7 @@ class ObjectPoseServer:
         object_specs: List[ObjectSpec],
         est_refine_iter: int,
         track_refine_iter: int,
+        internal_height: int,
         activate_2d_tracker: bool,
         activate_kalman_filter: bool,
         kf_measurement_noise_scale: float,
@@ -364,6 +396,7 @@ class ObjectPoseServer:
         self.calib_filedir = calib_filedir
         self.est_refine_iter = est_refine_iter
         self.track_refine_iter = track_refine_iter
+        self.internal_height = internal_height
         self.activate_2d_tracker = activate_2d_tracker
         self.activate_kalman_filter = activate_kalman_filter
         self.kf_measurement_noise_scale = kf_measurement_noise_scale
@@ -413,6 +446,13 @@ class ObjectPoseServer:
         for camera_name in self.camera_name_list:
             path = os.path.join(self.calib_filedir, kind, f"{camera_name}.pkl")
             if not os.path.exists(path):
+                if kind == "cam_extr":
+                    _logger.warning("Missing %s for camera %s, using identity transform: %s",
+                                    kind,
+                                    camera_name,
+                                    path)
+                    result[camera_name] = np.eye(4, dtype=np.float64)
+                    continue
                 raise FileNotFoundError(f"Missing {kind} for camera {camera_name}: {path}")
             with open(path, "rb") as f:
                 result[camera_name] = np.asarray(pickle.load(f), dtype=np.float64)
@@ -520,6 +560,7 @@ class ObjectPoseServer:
         width, height = self.video_shape
         colors: Dict[str, np.ndarray] = {}
         depths: Dict[str, np.ndarray] = {}
+        cam_intr_by_camera: Dict[str, np.ndarray] = {}
         camera_idx = 0
         for payload in synced_data:
             if not isinstance(payload, dict) or "color" not in payload:
@@ -528,7 +569,7 @@ class ObjectPoseServer:
                 break
             camera_name = self.camera_name_list[camera_idx]
             color = payload["color"].reshape(height, width, 3)
-            colors[camera_name] = color
+            depth: Optional[np.ndarray] = None
             if "depth" in payload:
                 depth = payload["depth"].reshape(height, width)
                 if depth.dtype == np.uint16:
@@ -536,12 +577,26 @@ class ObjectPoseServer:
                 else:
                     depth = depth.astype(np.float32)
                 depth[(depth < 0.001) | ~np.isfinite(depth)] = 0.0
-                depths[camera_name] = depth
+            resized_color, resized_depth, resized_K = resize_frame_and_intrinsics(
+                color=color,
+                depth=depth,
+                cam_K=self.cam_intr_map[camera_name],
+                target_height=self.internal_height,
+            )
+            colors[camera_name] = resized_color
+            cam_intr_by_camera[camera_name] = resized_K
+            if resized_depth is not None:
+                depths[camera_name] = resized_depth
             camera_idx += 1
 
         if not colors:
             return None
-        return SyncFrame(sync_timestamp=float(synced_ts), color_by_camera=colors, depth_by_camera=depths)
+        return SyncFrame(
+            sync_timestamp=float(synced_ts),
+            color_by_camera=colors,
+            depth_by_camera=depths,
+            cam_intr_by_camera=cam_intr_by_camera,
+        )
 
     def _select_camera(self, state: ObjectState, frame: SyncFrame) -> Optional[str]:
         if state.spec.camera_name:
@@ -766,7 +821,7 @@ class ObjectPoseServer:
             if state.mesh is None:
                 state.mesh = self.factory.load_mesh(state.spec)
             state.estimator = self.factory.create_estimator(state.spec, state.mesh)
-            cam_K = self.cam_intr_map[camera_name]
+            cam_K = frame.cam_intr_by_camera[camera_name]
             refine_iter = state.spec.est_refine_iter or self.est_refine_iter
             pose_cam = state.estimator.register(
                 K=cam_K,
@@ -802,6 +857,7 @@ class ObjectPoseServer:
                 "init_bbox_xywh": bbox_xywh,
                 "init_mask_area": int((mask > 0).sum()),
                 "init_mask_source": mask_source,
+                "init_input_shape": [int(color.shape[1]), int(color.shape[0])],
                 "init_sync_timestamp": frame.sync_timestamp,
             }
             _logger.info("Initialized %s from %s", state.spec.object_id, camera_name)
@@ -824,7 +880,7 @@ class ObjectPoseServer:
             return
 
         try:
-            cam_K = self.cam_intr_map[camera_name]
+            cam_K = frame.cam_intr_by_camera[camera_name]
             if self.activate_2d_tracker and state.tracker_2d is not None:
                 bbox = state.tracker_2d.track(color)
                 # Collect the tracking mask for visualization
@@ -912,7 +968,7 @@ class ObjectPoseServer:
             img = next(iter(frame.color_by_camera.values()))
             camera_name = next(iter(frame.color_by_camera.keys()))
         disp = cv2.cvtColor(img.copy(), cv2.COLOR_RGB2BGR)
-        cam_K = self.cam_intr_map.get(camera_name)
+        cam_K = frame.cam_intr_by_camera.get(camera_name)
 
         # --- Overlay tracking masks (semi-transparent + contour) ---
         _MASK_COLORS_BGR = [
@@ -1075,6 +1131,12 @@ def main() -> None:
     parser.add_argument("--object_config", type=str, required=True)
     parser.add_argument("--est_refine_iter", type=int, default=10)
     parser.add_argument("--track_refine_iter", type=int, default=5)
+    parser.add_argument(
+        "--internal_height",
+        type=int,
+        default=-1,
+        help="Internal RGB-D height. Use -1 to keep original frame size.",
+    )
     parser.add_argument("--activate_2d_tracker", action="store_true")
     parser.add_argument("--activate_kalman_filter", action="store_true")
     parser.add_argument("--kf_measurement_noise_scale", type=float, default=0.05)
@@ -1106,6 +1168,7 @@ def main() -> None:
         object_specs=object_specs,
         est_refine_iter=args.est_refine_iter,
         track_refine_iter=args.track_refine_iter,
+        internal_height=args.internal_height,
         activate_2d_tracker=args.activate_2d_tracker,
         activate_kalman_filter=args.activate_kalman_filter,
         kf_measurement_noise_scale=args.kf_measurement_noise_scale,

@@ -123,6 +123,7 @@ pip install "git+https://github.com/NVlabs/nvdiffrast.git"
 
 git clone --recursive https://github.com/NVIDIAGameWorks/kaolin /tmp/kaolin
 cd /tmp/kaolin
+git checkout v0.17.0
 FORCE_CUDA=1 pip install .
 ```
 
