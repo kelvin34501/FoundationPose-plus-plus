@@ -26,6 +26,11 @@ SAM_API_CHECKPOINT_PATH="${SAM_API_CHECKPOINT_PATH:-$SCRIPT_DIR/sam-hq/pretraine
 SAM_API_MODEL_TYPE="${SAM_API_MODEL_TYPE:-vit_l}"
 SAM_API_STARTUP_TIMEOUT="${SAM_API_STARTUP_TIMEOUT:-120}"
 
+WORLD_CALIB_ARGS=()
+if [[ -n "${WORLD_CALIB:-}" ]]; then
+  WORLD_CALIB_ARGS=(--world_calib "$WORLD_CALIB")
+fi
+
 SAM_API_AUTOSTART_ARGS=()
 if [[ "$SAM_API_AUTOSTART" == "1" || "$SAM_API_AUTOSTART" == "true" || "$SAM_API_AUTOSTART" == "yes" ]]; then
   SAM_API_AUTOSTART_ARGS=(--sam_api_autostart)
@@ -37,6 +42,7 @@ exec python server.py \
   --server.pub_channel "$PUB_CHANNEL" \
   --camera_info "$CAMERA_INFO" \
   --calib_filedir "$CALIB_FILEDIR" \
+  "${WORLD_CALIB_ARGS[@]}" \
   --object_config "$OBJECT_CONFIG" \
   --activate_2d_tracker \
   --activate_kalman_filter \

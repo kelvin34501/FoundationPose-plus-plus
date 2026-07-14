@@ -54,8 +54,13 @@ if FOUNDATIONPOSE_DIR not in sys.path:
 
 from VOT import Cutie, Tracker_2D  # noqa: E402
 from utils.kalman_filter_6d import KalmanFilter6D  # noqa: E402
+from world_calibration import load_fixed_camera_calibrations  # noqa: E402
 
 _logger = logging.getLogger("object_pose_server")
+
+# Preserve SAM request frames and masks for debugging. By default, exchange
+# both images in memory so object initialization does not create files.
+SAVE_SAM_INTERMEDIATE_FILES = False
 
 
 class ThrottleFilter(logging.Filter):
@@ -116,14 +121,6 @@ def parse_camera_info(value: str) -> Dict[str, str]:
         serial, name = item.split("=", 1)
         result[serial.strip()] = name.strip()
     return result
-
-
-def inv_transf_np(T: np.ndarray) -> np.ndarray:
-    T = np.asarray(T, dtype=np.float64)
-    out = np.eye(4, dtype=np.float64)
-    out[:3, :3] = T[:3, :3].T
-    out[:3, 3] = -out[:3, :3] @ T[:3, 3]
-    return out
 
 
 def get_pose_xy_from_image_point(
@@ -298,7 +295,8 @@ class ObjectState:
 
     @property
     def valid(self) -> bool:
-        return self.state == "tracking" and self.last_T_world_object is not None
+        return (self.state == "tracking" and self.last_T_camera_object is not None
+                and self.last_T_world_object is not None)
 
     def reset_runtime(self) -> None:
         self.state = "uninitialized"
@@ -372,6 +370,7 @@ class ObjectPoseServer:
         pub_channel: str,
         camera_info: Dict[str, str],
         calib_filedir: str,
+        world_calib: Optional[str],
         object_specs: List[ObjectSpec],
         est_refine_iter: int,
         track_refine_iter: int,
@@ -417,8 +416,9 @@ class ObjectPoseServer:
         self.sam_api_process: Optional[subprocess.Popen] = None
         self._closed = False
 
-        self.cam_intr_map = self._load_calib("cam_intr")
-        self.cam_extr_map = self._load_calib("cam_extr")
+        self.cam_intr_map = self._load_intrinsics()
+        fixed_camera_calibration = load_fixed_camera_calibrations(world_calib, self.camera_name_list)
+        self.T_world_camera_map = fixed_camera_calibration.T_world_camera_by_name
 
         self.ctx = zmq.Context()
         self.sync_socket = self.ctx.socket(zmq.SUB)
@@ -441,19 +441,12 @@ class ObjectPoseServer:
 
         self._maybe_start_sam_api()
 
-    def _load_calib(self, kind: str) -> Dict[str, np.ndarray]:
+    def _load_intrinsics(self) -> Dict[str, np.ndarray]:
         result: Dict[str, np.ndarray] = {}
         for camera_name in self.camera_name_list:
-            path = os.path.join(self.calib_filedir, kind, f"{camera_name}.pkl")
+            path = os.path.join(self.calib_filedir, "cam_intr", f"{camera_name}.pkl")
             if not os.path.exists(path):
-                if kind == "cam_extr":
-                    _logger.warning("Missing %s for camera %s, using identity transform: %s",
-                                    kind,
-                                    camera_name,
-                                    path)
-                    result[camera_name] = np.eye(4, dtype=np.float64)
-                    continue
-                raise FileNotFoundError(f"Missing {kind} for camera {camera_name}: {path}")
+                raise FileNotFoundError(f"Missing cam_intr for camera {camera_name}: {path}")
             with open(path, "rb") as f:
                 result[camera_name] = np.asarray(pickle.load(f), dtype=np.float64)
         return result
@@ -634,21 +627,43 @@ class ObjectPoseServer:
             _logger.warning("SAM-HQ API endpoint is not configured; cannot initialize from bbox prompt")
             return None
 
-        tmp_dir = os.path.join(THIS_DIR, "tmp", "object_pose_server")
-        os.makedirs(tmp_dir, exist_ok=True)
-        token = f"{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-        frame_path = os.path.join(tmp_dir, f"sam_frame_{token}.png")
-        mask_path = os.path.join(tmp_dir, f"sam_mask_{token}.png")
-        cv2.imwrite(frame_path, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
-        payload = json.dumps({
-            "frame_path": frame_path,
-            "bbox_xywh": list(map(int, bbox_xywh)),
-            "output_mask_path": mask_path,
-        }).encode("utf-8")
+        mask_path: Optional[str] = None
+        if SAVE_SAM_INTERMEDIATE_FILES:
+            tmp_dir = os.path.join(THIS_DIR, "tmp", "object_pose_server")
+            os.makedirs(tmp_dir, exist_ok=True)
+            token = f"{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+            frame_path = os.path.join(tmp_dir, f"sam_frame_{token}.png")
+            mask_path = os.path.join(tmp_dir, f"sam_mask_{token}.png")
+            cv2.imwrite(frame_path, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+            request_data = {
+                "frame_path": frame_path,
+                "bbox_xywh": list(map(int, bbox_xywh)),
+                "output_mask_path": mask_path,
+            }
+            endpoint = self.sam_api_endpoint
+            payload = json.dumps(request_data).encode("utf-8")
+            content_type = "application/json"
+        else:
+            encoded, frame_png = cv2.imencode(".png", cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+            if not encoded:
+                _logger.warning("Could not encode SAM input frame")
+                return None
+            x, y, width, height = map(int, bbox_xywh)
+            parsed_endpoint = urllib.parse.urlsplit(self.sam_api_endpoint)
+            endpoint = urllib.parse.urlunsplit((
+                parsed_endpoint.scheme,
+                parsed_endpoint.netloc,
+                parsed_endpoint.path.rstrip("/") + "/binary",
+                urllib.parse.urlencode({"x": x, "y": y, "w": width, "h": height}),
+                parsed_endpoint.fragment,
+            ))
+            payload = frame_png.tobytes()
+            content_type = "image/png"
+
         req = urllib.request.Request(
-            self.sam_api_endpoint,
+            endpoint,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": content_type},
             method="POST",
         )
         try:
@@ -656,13 +671,17 @@ class ObjectPoseServer:
                 if resp.status >= 300:
                     _logger.warning("SAM API returned HTTP %s", resp.status)
                     return None
+                response_data = resp.read()
         except (urllib.error.URLError, TimeoutError) as exc:
             _logger.warning("SAM API request failed: %s", exc)
             return None
 
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask_path is not None:
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        else:
+            mask = cv2.imdecode(np.frombuffer(response_data, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
         if mask is None:
-            _logger.warning("SAM API did not write mask to %s", mask_path)
+            _logger.warning("SAM API did not return a usable mask")
             return None
         return (mask > 0).astype(np.uint8)
 
@@ -850,7 +869,7 @@ class ObjectPoseServer:
                 state.kalman_filter = KalmanFilter6D(self.kf_measurement_noise_scale)
                 state.kf_mean, state.kf_covariance = state.kalman_filter.initiate(get_6d_pose_arr_from_mat(pose_cam))
             state.last_T_camera_object = np.asarray(pose_cam, dtype=np.float64)
-            state.last_T_world_object = inv_transf_np(self.cam_extr_map[camera_name]) @ pose_cam
+            state.last_T_world_object = self.T_world_camera_map[camera_name] @ state.last_T_camera_object
             state.state = "tracking"
             state.error_msg = None
             state.meta = {
@@ -924,7 +943,7 @@ class ObjectPoseServer:
                     state.kf_covariance,
                 )
             state.last_T_camera_object = np.asarray(pose_cam, dtype=np.float64)
-            state.last_T_world_object = inv_transf_np(self.cam_extr_map[camera_name]) @ pose_cam
+            state.last_T_world_object = self.T_world_camera_map[camera_name] @ state.last_T_camera_object
             state.state = "tracking"
             state.error_msg = None
         except Exception as exc:
@@ -937,6 +956,7 @@ class ObjectPoseServer:
         for state in self.object_states:
             object_payloads.append({
                 "object_id": state.spec.object_id,
+                "T_camera_object": state.last_T_camera_object,
                 "T_world_object": state.last_T_world_object,
                 "valid": state.valid,
                 "state": state.state,
@@ -1128,6 +1148,12 @@ def main() -> None:
     parser.add_argument("--server.pub_channel", type=str, required=True)
     parser.add_argument("--camera_info", type=parse_camera_info, required=True)
     parser.add_argument("--calib_filedir", type=str, required=True)
+    parser.add_argument(
+        "--world_calib",
+        type=str,
+        default=None,
+        help="Optional calibration session or world directory; defaults to the latest calib__* session",
+    )
     parser.add_argument("--object_config", type=str, required=True)
     parser.add_argument("--est_refine_iter", type=int, default=10)
     parser.add_argument("--track_refine_iter", type=int, default=5)
@@ -1165,6 +1191,7 @@ def main() -> None:
         pub_channel=getattr(args, "server.pub_channel"),
         camera_info=args.camera_info,
         calib_filedir=os.path.abspath(os.path.expanduser(args.calib_filedir)),
+        world_calib=args.world_calib,
         object_specs=object_specs,
         est_refine_iter=args.est_refine_iter,
         track_refine_iter=args.track_refine_iter,

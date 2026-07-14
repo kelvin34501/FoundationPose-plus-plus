@@ -2,10 +2,11 @@ import argparse
 import os
 from typing import List
 
+import cv2
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from PIL import Image
@@ -81,6 +82,34 @@ async def segment_image(message: Message):
         Image.fromarray(mask_uint8).save(message.output_mask_path)
 
         return Response(content="Mask generated successfully", media_type="text/plain", status_code=200)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.post("/hq_sam/binary")
+async def segment_image_binary(request: Request, x: int, y: int, w: int, h: int):
+    try:
+        frame_png = await request.body()
+        frame_bgr = cv2.imdecode(np.frombuffer(frame_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            raise ValueError("Request body is not a valid PNG image")
+
+        image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        height, width = image_rgb.shape[:2]
+        x1 = max(0, min(width - 1, x))
+        y1 = max(0, min(height - 1, y))
+        x2 = max(x1, min(width, x + w))
+        y2 = max(y1, min(height, y + h))
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(f"Invalid bbox_xywh for image shape {image_rgb.shape}: {[x, y, w, h]}")
+
+        mask = sam_model.segment(image_rgb, [x1, y1, x2, y2])
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        encoded, mask_png = cv2.imencode(".png", mask_uint8)
+        if not encoded:
+            raise RuntimeError("Could not encode SAM-HQ mask as PNG")
+
+        return Response(content=mask_png.tobytes(), media_type="image/png", status_code=200)
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
