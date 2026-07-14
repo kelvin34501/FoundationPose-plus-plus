@@ -3,8 +3,8 @@
 
 This server is intentionally started manually.  It subscribes to a SyncUnit
 RGB-D stream, lets the operator initialize one or more objects from the latest
-frame, tracks them with FoundationPose++, and publishes world-frame object
-poses using the same msgpack_numpy PUB pattern as WiLoR/POEM.
+frame, tracks them with FoundationPose++, publishes world-frame object poses,
+and serves higher-priority pose estimates for requested SyncUnit timestamps.
 """
 from __future__ import annotations
 
@@ -18,13 +18,15 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
 import cv2
 import msgpack
@@ -57,6 +59,7 @@ from utils.kalman_filter_6d import KalmanFilter6D  # noqa: E402
 from world_calibration import load_fixed_camera_calibrations  # noqa: E402
 
 _logger = logging.getLogger("object_pose_server")
+WINDOW_NAME = "object_pose_server"
 
 # Preserve SAM request frames and masks for debugging. By default, exchange
 # both images in memory so object initialization does not create files.
@@ -231,6 +234,75 @@ class SyncFrame:
     cam_intr_by_camera: Dict[str, np.ndarray]
 
 
+class SyncFrameCache:
+    """Thread-safe bounded cache keyed by the SyncUnit timestamp."""
+
+    def __init__(self, max_size: int):
+        if max_size <= 0:
+            raise ValueError(f"cache_size must be positive, got {max_size}")
+        self._frames: Deque[SyncFrame] = deque(maxlen=max_size)
+        self._lock = threading.Lock()
+
+    def add(self, frame: SyncFrame) -> None:
+        with self._lock:
+            self._frames.append(frame)
+
+    def latest(self) -> Optional[SyncFrame]:
+        with self._lock:
+            return self._frames[-1] if self._frames else None
+
+    def match(self, timestamp: float, tolerance_seconds: float) -> Optional[SyncFrame]:
+        with self._lock:
+            candidates = list(self._frames)
+        if not candidates:
+            return None
+        frame = min(
+            reversed(candidates),
+            key=lambda candidate: abs(candidate.sync_timestamp - timestamp),
+        )
+        if abs(frame.sync_timestamp - timestamp) > tolerance_seconds:
+            return None
+        return frame
+
+    def nearest_debug(self, timestamp: float, limit: int = 2) -> List[Dict[str, float]]:
+        with self._lock:
+            candidates = list(self._frames)
+        nearest = sorted(
+            reversed(candidates),
+            key=lambda candidate: abs(candidate.sync_timestamp - timestamp),
+        )[:max(0, limit)]
+        return [{
+            "sync_timestamp": frame.sync_timestamp,
+            "delta_ms": (frame.sync_timestamp - timestamp) * 1000.0,
+        } for frame in nearest]
+
+
+class PosePacketCache:
+    """Bounded cache of completed pose packets, owned by the GPU scheduler."""
+
+    def __init__(self, max_size: int):
+        if max_size <= 0:
+            raise ValueError(f"cache_size must be positive, got {max_size}")
+        self._packets: Deque[Dict[str, Any]] = deque(maxlen=max_size)
+
+    def add(self, packet: Dict[str, Any]) -> None:
+        self._packets.append(packet)
+
+    def clear(self) -> None:
+        self._packets.clear()
+
+    def match(self, timestamp: float, tolerance_seconds: float) -> Optional[Dict[str, Any]]:
+        if not self._packets:
+            return None
+        packet = min(
+            reversed(self._packets),
+            key=lambda candidate: abs(float(candidate["sync_timestamp"]) - timestamp),
+        )
+        if abs(float(packet["sync_timestamp"]) - timestamp) > tolerance_seconds:
+            return None
+        return packet
+
+
 def resize_frame_and_intrinsics(
     color: np.ndarray,
     depth: Optional[np.ndarray],
@@ -315,6 +387,21 @@ class ObjectState:
         self.meta = {}
 
 
+@dataclass
+class InitInteraction:
+    """Frozen RGB-D input and operator choices for one initialization attempt."""
+
+    object_idx: int
+    camera_name: str
+    frame: SyncFrame
+    mode: str = "roi"
+    drag_start: Optional[Tuple[int, int]] = None
+    drag_current: Optional[Tuple[int, int]] = None
+    bbox_xywh: Optional[Tuple[int, int, int, int]] = None
+    mask: Optional[np.ndarray] = None
+    mask_source: Optional[str] = None
+
+
 class FoundationPoseFactory:
 
     def __init__(self, debug: int = 0, debug_dir: str = "./debug/object_pose_server"):
@@ -368,6 +455,7 @@ class ObjectPoseServer:
         video_shape: Tuple[int, int],
         sync_channel: str,
         pub_channel: str,
+        request_channel: str,
         camera_info: Dict[str, str],
         calib_filedir: str,
         world_calib: Optional[str],
@@ -386,10 +474,14 @@ class ObjectPoseServer:
         sam_api_startup_timeout: float,
         display_scale: float,
         debug: int,
+        background_fps: float,
+        cache_size: int,
+        timestamp_tolerance_ms: float,
     ):
         self.video_shape = video_shape
         self.sync_channel = sync_channel
         self.pub_channel = pub_channel
+        self.request_channel = request_channel
         self.camera_info = camera_info
         self.camera_name_list = list(camera_info.values())
         self.calib_filedir = calib_filedir
@@ -407,6 +499,19 @@ class ObjectPoseServer:
         self.sam_api_startup_timeout = sam_api_startup_timeout
         self.display_scale = display_scale
         self.debug = debug
+        if not np.isfinite(display_scale) or display_scale <= 0.0:
+            raise ValueError(f"display_scale must be positive and finite, got {display_scale}")
+        if not np.isfinite(background_fps) or background_fps <= 0.0:
+            raise ValueError(f"background_fps must be positive and finite, got {background_fps}")
+        if not np.isfinite(timestamp_tolerance_ms) or timestamp_tolerance_ms < 0.0:
+            raise ValueError(
+                f"timestamp_tolerance_ms must be non-negative and finite, got {timestamp_tolerance_ms}")
+        self.background_fps = float(background_fps)
+        self.background_interval = 1.0 / self.background_fps
+        self.timestamp_tolerance = float(timestamp_tolerance_ms) / 1000.0
+        self.cache_size = int(cache_size)
+        self.frame_cache = SyncFrameCache(cache_size)
+        self.pose_cache = PosePacketCache(cache_size)
 
         self.object_states = [ObjectState(spec=spec) for spec in object_specs]
         self.current_object_idx = 0
@@ -414,6 +519,13 @@ class ObjectPoseServer:
         self.shutdown = False
         self.factory: Optional[FoundationPoseFactory] = None
         self.sam_api_process: Optional[subprocess.Popen] = None
+        self.cache_thread: Optional[threading.Thread] = None
+        self.last_tracking_timestamp: Optional[float] = None
+        self.init_interaction: Optional[InitInteraction] = None
+        self.selected_camera_by_object: Dict[int, str] = {}
+        self.ui_message: Optional[str] = None
+        self._ui_dirty = True
+        self._window_created = False
         self._closed = False
 
         self.cam_intr_map = self._load_intrinsics()
@@ -421,13 +533,6 @@ class ObjectPoseServer:
         self.T_world_camera_map = fixed_camera_calibration.T_world_camera_by_name
 
         self.ctx = zmq.Context()
-        self.sync_socket = self.ctx.socket(zmq.SUB)
-        self.sync_socket.setsockopt(zmq.SUBSCRIBE, b"")
-        self.sync_socket.setsockopt(zmq.RCVHWM, 1)
-        self.sync_socket.setsockopt(zmq.CONFLATE, 1)
-        sync_endpoint = channel_name_to_endpoint(sync_channel)
-        ensure_ipc_dir(sync_endpoint)
-        self.sync_socket.connect(sync_endpoint)
 
         self.pub_socket = self.ctx.socket(zmq.PUB)
         self.pub_socket.setsockopt(zmq.SNDHWM, 1)
@@ -436,10 +541,14 @@ class ObjectPoseServer:
         ensure_ipc_dir(pub_endpoint)
         self.pub_socket.bind(pub_endpoint)
 
-        self.poller = zmq.Poller()
-        self.poller.register(self.sync_socket, zmq.POLLIN)
+        self.request_socket = self.ctx.socket(zmq.REP)
+        self.request_socket.setsockopt(zmq.LINGER, 0)
+        request_endpoint = channel_name_to_endpoint(request_channel)
+        ensure_ipc_dir(request_endpoint)
+        self.request_socket.bind(request_endpoint)
 
-        self._maybe_start_sam_api()
+        self.poller = zmq.Poller()
+        self.poller.register(self.request_socket, zmq.POLLIN)
 
     def _load_intrinsics(self) -> Dict[str, np.ndarray]:
         result: Dict[str, np.ndarray] = {}
@@ -455,9 +564,12 @@ class ObjectPoseServer:
         if self._closed:
             return
         self._closed = True
+        self.shutdown = True
+        if self.cache_thread is not None and self.cache_thread.is_alive():
+            self.cache_thread.join(timeout=1.0)
         cv2.destroyAllWindows()
-        self.sync_socket.close(linger=0)
         self.pub_socket.close(linger=0)
+        self.request_socket.close(linger=0)
         self.ctx.term()
         self._stop_sam_api()
 
@@ -591,25 +703,160 @@ class ObjectPoseServer:
             cam_intr_by_camera=cam_intr_by_camera,
         )
 
-    def _select_camera(self, state: ObjectState, frame: SyncFrame) -> Optional[str]:
-        if state.spec.camera_name:
-            if state.spec.camera_name not in frame.color_by_camera:
-                _logger.error("Configured camera %s is not in latest frame", state.spec.camera_name)
-                return None
-            return state.spec.camera_name
-
-        available = list(frame.color_by_camera.keys())
-        print("\nAvailable cameras:")
-        for i, camera_name in enumerate(available):
-            print(f"  [{i}] {camera_name}")
-        raw = input(f"Select init camera for {state.spec.object_id} [0]: ").strip()
-        if raw == "":
-            return available[0]
+    def _cache_sync_frames(self) -> None:
+        """Continuously decode SyncUnit frames without blocking GPU inference."""
+        socket = self.ctx.socket(zmq.SUB)
+        socket.setsockopt(zmq.SUBSCRIBE, b"")
+        socket.setsockopt(zmq.RCVHWM, self.cache_size)
+        endpoint = channel_name_to_endpoint(self.sync_channel)
+        ensure_ipc_dir(endpoint)
+        socket.connect(endpoint)
+        poller = zmq.Poller()
+        poller.register(socket, zmq.POLLIN)
         try:
-            return available[int(raw)]
-        except Exception:
-            _logger.warning("Invalid camera selection %r; using %s", raw, available[0])
-            return available[0]
+            while not self.shutdown:
+                if socket not in dict(poller.poll(timeout=250)):
+                    continue
+                try:
+                    frame = self._decode_sync_message(socket.recv())
+                    if frame is not None:
+                        self.frame_cache.add(frame)
+                except Exception as exc:
+                    _logger.warning("Skipping malformed SyncUnit frame: %s", exc)
+        finally:
+            poller.unregister(socket)
+            socket.close(linger=0)
+
+    def _start_cache_thread(self) -> None:
+        self.cache_thread = threading.Thread(
+            target=self._cache_sync_frames,
+            name="foundationpose-sync-cache",
+            daemon=True,
+        )
+        self.cache_thread.start()
+
+    @staticmethod
+    def _available_init_cameras(frame: SyncFrame) -> List[str]:
+        return [
+            camera_name
+            for camera_name in frame.color_by_camera
+            if camera_name in frame.depth_by_camera and camera_name in frame.cam_intr_by_camera
+        ]
+
+    def _preview_camera(self, frame: SyncFrame) -> Optional[str]:
+        state = self.object_states[self.current_object_idx]
+        if state.source_camera in frame.color_by_camera:
+            return state.source_camera
+        if state.spec.camera_name:
+            return state.spec.camera_name if state.spec.camera_name in frame.color_by_camera else None
+
+        available = self._available_init_cameras(frame)
+        if not available:
+            return next(iter(frame.color_by_camera), None)
+        selected = self.selected_camera_by_object.get(self.current_object_idx)
+        if selected not in available:
+            selected = available[0]
+            self.selected_camera_by_object[self.current_object_idx] = selected
+        return selected
+
+    def _cycle_init_camera(self, delta: int) -> None:
+        if self.latest_frame is None:
+            self.ui_message = "No synchronized RGB-D frame is available"
+            return
+        state = self.object_states[self.current_object_idx]
+        if state.spec.camera_name:
+            self.ui_message = f"Camera is pinned to {state.spec.camera_name} by object config"
+            return
+        if state.source_camera:
+            self.ui_message = "Reset the tracked object before changing its initialization camera"
+            return
+        available = self._available_init_cameras(self.latest_frame)
+        if not available:
+            self.ui_message = "No camera currently has synchronized RGB-D data"
+            return
+        current = self.selected_camera_by_object.get(self.current_object_idx, available[0])
+        current_idx = available.index(current) if current in available else 0
+        selected = available[(current_idx + delta) % len(available)]
+        self.selected_camera_by_object[self.current_object_idx] = selected
+        self.ui_message = f"Selected initialization camera: {selected}"
+
+    def _start_init_interaction(self) -> None:
+        if self.latest_frame is None:
+            self.ui_message = "No synchronized frame is available for initialization"
+            return
+        state = self.object_states[self.current_object_idx]
+        if state.state != "uninitialized":
+            self.ui_message = f"Reset {state.spec.object_id} before initializing it again"
+            return
+        camera_name = self._preview_camera(self.latest_frame)
+        if (camera_name is None or camera_name not in self.latest_frame.color_by_camera or
+                camera_name not in self.latest_frame.depth_by_camera or
+                camera_name not in self.latest_frame.cam_intr_by_camera):
+            self.ui_message = "Selected camera does not have synchronized RGB-D data"
+            return
+
+        state.meta["init_attempted"] = True
+        state.error_msg = None
+        self.init_interaction = InitInteraction(
+            object_idx=self.current_object_idx,
+            camera_name=camera_name,
+            frame=self.latest_frame,
+        )
+        self.ui_message = "Drag a bounding box, then press Enter/Space"
+        _logger.info("Selecting initialization ROI for %s from %s", state.spec.object_id, camera_name)
+
+    def _cancel_init_interaction(self) -> None:
+        interaction = self.init_interaction
+        if interaction is None:
+            return
+        state = self.object_states[interaction.object_idx]
+        state.reset_runtime()
+        state.meta["init_cancelled"] = True
+        state.error_msg = "Initialization cancelled"
+        self.init_interaction = None
+        self.ui_message = f"Initialization cancelled for {state.spec.object_id}"
+        _logger.info("Initialization cancelled for %s", state.spec.object_id)
+
+    @staticmethod
+    def _bbox_from_points(
+        start: Tuple[int, int],
+        end: Tuple[int, int],
+        shape: Tuple[int, int],
+    ) -> Optional[Tuple[int, int, int, int]]:
+        height, width = shape
+        x1, x2 = sorted((max(0, min(width - 1, start[0])), max(0, min(width - 1, end[0]))))
+        y1, y2 = sorted((max(0, min(height - 1, start[1])), max(0, min(height - 1, end[1]))))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2 - x1, y2 - y1
+
+    def _display_to_image_point(self, x: int, y: int, shape: Tuple[int, int]) -> Tuple[int, int]:
+        height, width = shape
+        image_x = int(round(x / self.display_scale))
+        image_y = int(round(y / self.display_scale))
+        return max(0, min(width - 1, image_x)), max(0, min(height - 1, image_y))
+
+    def _handle_mouse(self, event: int, x: int, y: int, _flags: int, _param: Any = None) -> None:
+        interaction = self.init_interaction
+        if interaction is None or interaction.mode != "roi":
+            return
+        shape = interaction.frame.color_by_camera[interaction.camera_name].shape[:2]
+        point = self._display_to_image_point(x, y, shape)
+        if event == cv2.EVENT_LBUTTONDOWN:
+            interaction.drag_start = point
+            interaction.drag_current = point
+            interaction.bbox_xywh = None
+        elif event == cv2.EVENT_MOUSEMOVE and interaction.drag_start is not None:
+            interaction.drag_current = point
+        elif event == cv2.EVENT_LBUTTONUP and interaction.drag_start is not None:
+            interaction.drag_current = point
+            interaction.bbox_xywh = self._bbox_from_points(interaction.drag_start, point, shape)
+            interaction.drag_start = None
+            if interaction.bbox_xywh is None:
+                self.ui_message = "ROI must have non-zero width and height"
+            else:
+                self.ui_message = "Press Enter/Space to segment this ROI"
+        self._ui_dirty = True
 
     def _read_mask_override(self, state: ObjectState, shape: Tuple[int, int]) -> Optional[np.ndarray]:
         mask_path = state.spec.mask_path
@@ -685,37 +932,6 @@ class ObjectPoseServer:
             return None
         return (mask > 0).astype(np.uint8)
 
-    def _select_bbox(
-        self,
-        frame_rgb: np.ndarray,
-        object_id: str,
-        camera_name: str,
-    ) -> Optional[Tuple[int, int, int, int]]:
-        window = f"init:{object_id}:{camera_name}"
-        display = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        if self.display_scale != 1.0:
-            display = cv2.resize(display, None, fx=self.display_scale, fy=self.display_scale)
-        cv2.imshow(window, display)
-        cv2.waitKey(1)
-
-        print(f"\nInitializing object: {object_id}")
-        print("Draw bbox and press Enter/Space. Press c to cancel.")
-        roi = cv2.selectROI(window, display, showCrosshair=True, fromCenter=False)
-        cv2.destroyWindow(window)
-        if roi[2] <= 0 or roi[3] <= 0:
-            return None
-
-        scale = self.display_scale if self.display_scale != 0 else 1.0
-        x, y, w, h = (int(round(v / scale)) for v in roi)
-        height, width = frame_rgb.shape[:2]
-        x1 = max(0, min(width - 1, x))
-        y1 = max(0, min(height - 1, y))
-        x2 = max(x1, min(width, x + max(0, w)))
-        y2 = max(y1, min(height, y + max(0, h)))
-        if x2 <= x1 or y2 <= y1:
-            return None
-        return x1, y1, x2 - x1, y2 - y1
-
     def _validate_init_mask(
         self,
         state: ObjectState,
@@ -735,108 +951,64 @@ class ObjectPoseServer:
         state.meta["init_mask_area"] = area
         return None
 
-    def _confirm_init_mask(
-        self,
-        frame_rgb: np.ndarray,
-        mask: np.ndarray,
-        bbox_xywh: Tuple[int, int, int, int],
-        object_id: str,
-        camera_name: str,
-    ) -> str:
-        overlay = frame_rgb.copy()
-        mask_bool = mask.astype(bool)
-        mask_color = np.asarray([0, 255, 0], dtype=np.uint8)
-        overlay[mask_bool] = (0.55 * overlay[mask_bool] + 0.45 * mask_color).astype(np.uint8)
+    def _prepare_init_mask(self) -> None:
+        interaction = self.init_interaction
+        if interaction is None or interaction.mode != "roi":
+            return
+        if interaction.bbox_xywh is None:
+            self.ui_message = "Draw a valid ROI before submitting"
+            return
 
-        disp = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-        x, y, w, h = bbox_xywh
-        cv2.rectangle(disp, (x, y), (x + w, y + h), (0, 220, 255), 2)
-        cv2.putText(
-            disp,
-            "Enter/Space: accept  r: redraw bbox  q/Esc: cancel",
-            (10, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        window = f"mask:{object_id}:{camera_name}"
-        if self.display_scale != 1.0:
-            disp = cv2.resize(disp, None, fx=self.display_scale, fy=self.display_scale)
-        cv2.imshow(window, disp)
-
-        while True:
-            key = cv2.waitKey(0)
-            if key < 0:
-                continue
-            key &= 0xFF
-            if key in (13, 10, 32):
-                cv2.destroyWindow(window)
-                return "accept"
-            if key == ord("r"):
-                cv2.destroyWindow(window)
-                return "redraw"
-            if key == ord("q") or key == 27:
-                cv2.destroyWindow(window)
-                return "cancel"
-
-    def _init_object(self, state: ObjectState, frame: SyncFrame) -> bool:
-        state.meta["init_attempted"] = True
-        if self.factory is None:
-            _logger.info("Loading FoundationPose models...")
-            self.factory = FoundationPoseFactory(debug=self.debug)
-
-        camera_name = self._select_camera(state, frame)
-        if camera_name is None or camera_name not in frame.depth_by_camera:
-            state.state = "uninitialized"
-            state.error_msg = f"No RGB-D frame available for camera {camera_name}"
-            _logger.error(state.error_msg)
-            return False
-
-        color = frame.color_by_camera[camera_name]
-        depth = frame.depth_by_camera[camera_name]
-        mask_source = "sam_hq"
-        while True:
-            bbox_xywh = self._select_bbox(color, state.spec.object_id, camera_name)
-            if bbox_xywh is None:
-                state.meta["init_cancelled"] = True
-                state.error_msg = "Initialization cancelled"
-                _logger.info("Initialization cancelled for %s", state.spec.object_id)
-                return False
-
-            try:
-                mask = self._read_mask_override(state, color.shape[:2])
-            except Exception as exc:
-                state.error_msg = str(exc)
-                _logger.error("%s: %s", state.spec.object_id, state.error_msg)
-                return False
+        state = self.object_states[interaction.object_idx]
+        color = interaction.frame.color_by_camera[interaction.camera_name]
+        interaction.mode = "processing_mask"
+        self.ui_message = "Generating initialization mask..."
+        self._draw_status(interaction.frame)
+        cv2.waitKey(1)
+        try:
+            mask = self._read_mask_override(state, color.shape[:2])
+            mask_source = "mask_path"
             if mask is None:
-                mask = self._request_sam_mask(color, bbox_xywh)
+                mask = self._request_sam_mask(color, interaction.bbox_xywh)
                 mask_source = "sam_hq"
-            else:
-                mask_source = "mask_path"
             if mask is None:
-                state.error_msg = "SAM-HQ did not return a usable init mask"
-                _logger.error("%s: %s", state.spec.object_id, state.error_msg)
-                return False
-
+                raise RuntimeError("SAM-HQ did not return a usable init mask")
             mask_error = self._validate_init_mask(state, mask, color.shape[:2])
             if mask_error is not None:
-                state.error_msg = mask_error
-                _logger.error("%s: %s", state.spec.object_id, state.error_msg)
-                return False
+                raise ValueError(mask_error)
+        except Exception as exc:
+            interaction.mode = "roi"
+            state.error_msg = str(exc)
+            self.ui_message = f"Mask failed: {exc}"
+            _logger.error("%s: %s", state.spec.object_id, state.error_msg)
+            return
 
-            confirm = self._confirm_init_mask(color, mask, bbox_xywh, state.spec.object_id, camera_name)
-            if confirm == "accept":
-                break
-            if confirm == "redraw":
-                continue
-            state.meta["init_cancelled"] = True
-            state.error_msg = "Initialization cancelled"
-            _logger.info("Initialization cancelled for %s", state.spec.object_id)
+        interaction.mask = mask
+        interaction.mask_source = mask_source
+        interaction.mode = "mask"
+        state.error_msg = None
+        self.ui_message = "Enter/Space: accept mask; r: redraw; c/Esc: cancel"
+
+    def _complete_initialization(self) -> bool:
+        interaction = self.init_interaction
+        if (interaction is None or interaction.mode != "mask" or interaction.mask is None or
+                interaction.bbox_xywh is None or interaction.mask_source is None):
             return False
 
+        state = self.object_states[interaction.object_idx]
+        frame = interaction.frame
+        camera_name = interaction.camera_name
+        color = frame.color_by_camera[camera_name]
+        depth = frame.depth_by_camera[camera_name]
+        mask = interaction.mask
+        interaction.mode = "initializing"
+        self.ui_message = "Loading models and registering pose..."
+        self._draw_status(frame)
+        cv2.waitKey(1)
         try:
+            if self.factory is None:
+                _logger.info("Loading FoundationPose models...")
+                self.factory = FoundationPoseFactory(debug=self.debug)
             if state.mesh is None:
                 state.mesh = self.factory.load_mesh(state.spec)
             state.estimator = self.factory.create_estimator(state.spec, state.mesh)
@@ -873,17 +1045,26 @@ class ObjectPoseServer:
             state.state = "tracking"
             state.error_msg = None
             state.meta = {
-                "init_bbox_xywh": bbox_xywh,
+                "init_bbox_xywh": interaction.bbox_xywh,
                 "init_mask_area": int((mask > 0).sum()),
-                "init_mask_source": mask_source,
+                "init_mask_source": interaction.mask_source,
                 "init_input_shape": [int(color.shape[1]), int(color.shape[0])],
                 "init_sync_timestamp": frame.sync_timestamp,
             }
+            self.last_tracking_timestamp = max(
+                self.last_tracking_timestamp if self.last_tracking_timestamp is not None else -np.inf,
+                frame.sync_timestamp,
+            )
+            self.pose_cache.clear()
+            self.init_interaction = None
+            self.ui_message = f"Initialized {state.spec.object_id} from {camera_name}"
             _logger.info("Initialized %s from %s", state.spec.object_id, camera_name)
             return True
         except Exception as exc:
-            state.state = "uninitialized"
+            state.reset_runtime()
             state.error_msg = str(exc)
+            interaction.mode = "mask"
+            self.ui_message = f"Initialization failed: {exc}"
             _logger.exception("Failed to initialize %s", state.spec.object_id)
             return False
 
@@ -951,38 +1132,218 @@ class ObjectPoseServer:
             state.error_msg = str(exc)
             _logger.exception("Tracking failed for %s", state.spec.object_id)
 
-    def _publish(self, sync_timestamp: float, process_time: float) -> None:
-        object_payloads = []
-        for state in self.object_states:
-            object_payloads.append({
-                "object_id": state.spec.object_id,
-                "T_camera_object": state.last_T_camera_object,
-                "T_world_object": state.last_T_world_object,
-                "valid": state.valid,
-                "state": state.state,
-                "score": state.last_score,
-                "source_camera": state.source_camera,
-                "meta": {
-                    **state.meta,
-                    **({
-                        "error": state.error_msg
-                    } if state.error_msg else {}),
-                },
-            })
+    @staticmethod
+    def _state_object_payload(state: ObjectState) -> Dict[str, Any]:
+        return {
+            "object_id": state.spec.object_id,
+            "T_camera_object": state.last_T_camera_object,
+            "T_world_object": state.last_T_world_object,
+            "valid": state.valid,
+            "state": state.state,
+            "score": state.last_score,
+            "source_camera": state.source_camera,
+            "meta": {
+                **state.meta,
+                **({"error": state.error_msg} if state.error_msg else {}),
+            },
+        }
 
-        msg = {
+    def _make_pose_packet(
+        self,
+        sync_timestamp: float,
+        process_time: float,
+        object_payloads: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        return {
             "sync_timestamp": sync_timestamp,
             "server_timestamp": time.time(),
-            "object_poses": object_payloads,
+            "object_poses": (object_payloads if object_payloads is not None else
+                             [self._state_object_payload(state) for state in self.object_states]),
             "process_time": process_time,
         }
-        self.pub_socket.send(msgpack.packb(msg, default=msgpack_numpy.encode))
+
+    def _publish_packet(self, packet: Mapping[str, Any]) -> None:
+        self.pub_socket.send(msgpack.packb(dict(packet), default=msgpack_numpy.encode))
+
+    def _process_tracking_frame(self, frame: SyncFrame, publish: bool = True) -> Dict[str, Any]:
+        started = time.perf_counter()
+        for state in self.object_states:
+            self._track_object(state, frame)
+        packet = self._make_pose_packet(frame.sync_timestamp, time.perf_counter() - started)
+        self.last_tracking_timestamp = frame.sync_timestamp
+        self.pose_cache.add(packet)
+        if publish:
+            self._publish_packet(packet)
+        return packet
+
+    def _process_isolated_request(self, frame: SyncFrame) -> Dict[str, Any]:
+        """Refine an older frame without rewinding continuous tracker state."""
+        started = time.perf_counter()
+        object_payloads: List[Dict[str, Any]] = []
+        for state in self.object_states:
+            if not state.valid or state.estimator is None or state.source_camera is None:
+                object_payloads.append(self._state_object_payload(state))
+                continue
+
+            camera_name = state.source_camera
+            color = frame.color_by_camera.get(camera_name)
+            depth = frame.depth_by_camera.get(camera_name)
+            cam_K = frame.cam_intr_by_camera.get(camera_name)
+            if color is None or depth is None or cam_K is None:
+                raise RuntimeError(
+                    f"Requested frame is missing RGB-D or intrinsics for camera {camera_name}")
+            pose_last = state.estimator.pose_last
+            if pose_last is None:
+                raise RuntimeError(f"Object {state.spec.object_id} has no pose seed")
+
+            pose_seed = pose_last.detach().clone()
+            try:
+                pose_cam = state.estimator.track_one_w_spec_last_pose(
+                    rgb=color,
+                    depth=depth,
+                    K=cam_K,
+                    iteration=state.spec.track_refine_iter or self.track_refine_iter,
+                    spec_last_pose=pose_seed,
+                )
+            finally:
+                # track_one_w_spec_last_pose mutates pose_last; an older request must not
+                # rewind the state consumed by Cutie, Kalman, or background tracking.
+                state.estimator.pose_last = pose_last
+
+            T_camera_object = np.asarray(pose_cam, dtype=np.float64)
+            T_world_object = self.T_world_camera_map[camera_name] @ T_camera_object
+            object_payloads.append({
+                "object_id": state.spec.object_id,
+                "T_camera_object": T_camera_object,
+                "T_world_object": T_world_object,
+                "valid": True,
+                "state": "tracking",
+                "score": state.last_score,
+                "source_camera": camera_name,
+                "meta": {**state.meta, "request_processing": "isolated"},
+            })
+
+        packet = self._make_pose_packet(
+            frame.sync_timestamp,
+            time.perf_counter() - started,
+            object_payloads,
+        )
+        self.pose_cache.add(packet)
+        return packet
+
+    @staticmethod
+    def _request_error(
+        code: str,
+        message: str,
+        requested_synced_ts: Optional[float] = None,
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        response: Dict[str, Any] = {
+            "ok": False,
+            "error": {"code": code, "message": message},
+            "server_timestamp": time.time(),
+        }
+        if requested_synced_ts is not None:
+            response["requested_synced_ts"] = requested_synced_ts
+        if details is not None:
+            response["error"]["details"] = dict(details)
+        return response
+
+    @staticmethod
+    def _decode_pose_request(message: bytes) -> float:
+        request = msgpack.unpackb(message, raw=False)
+        if not isinstance(request, dict):
+            raise ValueError("request must be a mapping")
+        value = request.get("synced_ts")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("synced_ts must be a finite number")
+        timestamp = float(value)
+        if not np.isfinite(timestamp):
+            raise ValueError("synced_ts must be a finite number")
+        return timestamp
+
+    def _handle_pose_request(self, message: bytes) -> Dict[str, Any]:
+        requested_timestamp: Optional[float] = None
+        try:
+            requested_timestamp = self._decode_pose_request(message)
+        except Exception as exc:
+            return self._request_error("invalid_request", str(exc))
+
+        cached_packet = self.pose_cache.match(requested_timestamp, self.timestamp_tolerance)
+        if cached_packet is not None:
+            response = dict(cached_packet)
+            response.update({
+                "ok": True,
+                "requested_synced_ts": requested_timestamp,
+                "request_processing": "cached",
+            })
+            return response
+
+        frame = self.frame_cache.match(requested_timestamp, self.timestamp_tolerance)
+        if frame is None:
+            details = {
+                "requested_synced_ts": requested_timestamp,
+                "tolerance_ms": self.timestamp_tolerance * 1000.0,
+                "syncunit_nearest": self.frame_cache.nearest_debug(requested_timestamp),
+            }
+            return self._request_error(
+                "cache_miss",
+                f"no cached SyncUnit frame is within {self.timestamp_tolerance * 1000.0:g} ms "
+                f"of synced_ts {requested_timestamp:.6f}",
+                requested_timestamp,
+                details,
+            )
+
+        if not any(state.valid for state in self.object_states):
+            return self._request_error(
+                "not_ready",
+                "FoundationPose++ has no initialized tracking object",
+                requested_timestamp,
+            )
+
+        try:
+            if (self.last_tracking_timestamp is None or
+                    frame.sync_timestamp > self.last_tracking_timestamp + self.timestamp_tolerance):
+                packet = self._process_tracking_frame(frame, publish=True)
+                request_processing = "tracking"
+            else:
+                packet = self._process_isolated_request(frame)
+                request_processing = "isolated"
+        except Exception as exc:
+            _logger.exception("Timestamp-requested pose estimation failed")
+            return self._request_error(
+                "inference_error",
+                str(exc),
+                requested_timestamp,
+            )
+
+        response = dict(packet)
+        response.update({
+            "ok": True,
+            "requested_synced_ts": requested_timestamp,
+            "request_processing": request_processing,
+        })
+        _logger.info(
+            "Pose request %.6f matched %.6f (%+.3f ms, %s, %.1f ms)",
+            requested_timestamp,
+            frame.sync_timestamp,
+            (frame.sync_timestamp - requested_timestamp) * 1000.0,
+            request_processing,
+            float(packet["process_time"]) * 1000.0,
+        )
+        return response
 
     def _draw_status(self, frame: SyncFrame) -> None:
         if not frame.color_by_camera:
             return
-        current = self.object_states[self.current_object_idx]
-        camera_name = current.source_camera or current.spec.camera_name or next(iter(frame.color_by_camera.keys()))
+        interaction = self.init_interaction
+        if interaction is not None:
+            frame = interaction.frame
+            camera_name = interaction.camera_name
+        else:
+            camera_name = self._preview_camera(frame)
+        if camera_name is None:
+            camera_name = next(iter(frame.color_by_camera.keys()))
         img = frame.color_by_camera.get(camera_name)
         if img is None:
             img = next(iter(frame.color_by_camera.values()))
@@ -1031,9 +1392,31 @@ class ObjectPoseServer:
                     axis_scale=axis_scale,
                     thickness=4 if i == self.current_object_idx else 2,
                 )
+
+        if interaction is not None:
+            if interaction.mask is not None:
+                mask_bool = interaction.mask.astype(bool)
+                overlay = disp.copy()
+                overlay[mask_bool] = (0, 190, 0)
+                disp = cv2.addWeighted(disp, 0.55, overlay, 0.45, 0)
+            bbox = interaction.bbox_xywh
+            if interaction.drag_start is not None and interaction.drag_current is not None:
+                bbox = self._bbox_from_points(interaction.drag_start, interaction.drag_current, img.shape[:2])
+            if bbox is not None:
+                x, y, width, height = bbox
+                cv2.rectangle(disp, (x, y), (x + width, y + height), (0, 220, 255), 2)
+
         y = 24
-        cv2.putText(disp, f"camera={camera_name} sync={frame.sync_timestamp:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (255, 255, 255), 2)
+        mode = interaction.mode if interaction is not None else "idle"
+        cv2.putText(
+            disp,
+            f"camera={camera_name} sync={frame.sync_timestamp:.3f} mode={mode}",
+            (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
         y += 26
         for i, state in enumerate(self.object_states):
             marker = ">" if i == self.current_object_idx else " "
@@ -1043,64 +1426,222 @@ class ObjectPoseServer:
             cv2.putText(disp, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             y += 24
         y += 6
-        cv2.putText(disp, "[/]: select  i:init  r:reset current  a:reset all  q:quit", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        if interaction is None:
+            controls = "[/]: object  ,/.: camera  i:init  r:reset current  a:reset all  q:quit"
+        elif interaction.mode == "roi":
+            controls = "mouse drag: ROI  Enter/Space: segment  c/Esc: cancel"
+        elif interaction.mode == "mask":
+            controls = "Enter/Space: accept mask  r:redraw ROI  c/Esc: cancel"
+        elif interaction.mode == "processing_mask":
+            controls = "Generating mask..."
+        else:
+            controls = "Initializing pose..."
+        cv2.putText(
+            disp,
+            controls,
+            (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (255, 255, 255),
+            2,
+        )
+        if self.ui_message:
+            cv2.putText(
+                disp,
+                self.ui_message,
+                (10, min(disp.shape[0] - 12, y + 26)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (0, 220, 255),
+                2,
+            )
         if self.display_scale != 1.0:
             disp = cv2.resize(disp, None, fx=self.display_scale, fy=self.display_scale)
-        cv2.imshow("object_pose_server", disp)
+        cv2.imshow(WINDOW_NAME, disp)
+
+    def _create_window(self) -> None:
+        try:
+            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+            cv2.setMouseCallback(WINDOW_NAME, self._handle_mouse)
+            self._window_created = True
+            self._draw_waiting_window()
+            cv2.waitKey(1)
+        except cv2.error as exc:
+            raise RuntimeError(
+                "Could not create the required OpenCV interaction window; check DISPLAY and OpenCV GUI support"
+            ) from exc
+
+    def _draw_waiting_window(self) -> None:
+        width, height = 640, 360
+        disp = np.zeros((height, width, 3), dtype=np.uint8)
+        cv2.putText(
+            disp,
+            "FoundationPose++: waiting for synchronized RGB-D frames...",
+            (24, height // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            disp,
+            "q/Esc: quit",
+            (24, height // 2 + 38),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (0, 220, 255),
+            2,
+        )
+        cv2.imshow(WINDOW_NAME, disp)
+
+    def _redraw_ui(self) -> None:
+        frame = self.init_interaction.frame if self.init_interaction is not None else self.latest_frame
+        if frame is None:
+            self._draw_waiting_window()
+        else:
+            self._draw_status(frame)
+        self._ui_dirty = False
+
+    def _pump_ui(self) -> None:
+        self._handle_key(cv2.waitKey(1))
+        if self._window_created:
+            try:
+                if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                    self.shutdown = True
+            except cv2.error:
+                self.shutdown = True
 
     def _handle_key(self, key: int) -> None:
         if key < 0:
             return
         key &= 0xFF
+        interaction = self.init_interaction
+        if interaction is not None:
+            if interaction.mode == "roi":
+                if key in (13, 10, 32):
+                    self._prepare_init_mask()
+                elif key in (ord("c"), ord("q"), 27):
+                    self._cancel_init_interaction()
+            elif interaction.mode == "mask":
+                if key in (13, 10, 32):
+                    self._complete_initialization()
+                elif key == ord("r"):
+                    interaction.mode = "roi"
+                    interaction.drag_start = None
+                    interaction.drag_current = None
+                    interaction.bbox_xywh = None
+                    interaction.mask = None
+                    interaction.mask_source = None
+                    self.ui_message = "Drag a new bounding box, then press Enter/Space"
+                elif key in (ord("c"), ord("q"), 27):
+                    self._cancel_init_interaction()
+            self._ui_dirty = True
+            return
+
         if key == ord("q") or key == 27:
             self.shutdown = True
         elif key == ord("["):
             self.current_object_idx = (self.current_object_idx - 1) % len(self.object_states)
+            self.ui_message = f"Selected object: {self.object_states[self.current_object_idx].spec.object_id}"
         elif key == ord("]"):
             self.current_object_idx = (self.current_object_idx + 1) % len(self.object_states)
+            self.ui_message = f"Selected object: {self.object_states[self.current_object_idx].spec.object_id}"
+        elif key == ord(","):
+            self._cycle_init_camera(-1)
+        elif key == ord("."):
+            self._cycle_init_camera(1)
         elif key == ord("r"):
             state = self.object_states[self.current_object_idx]
             _logger.info("Resetting object %s", state.spec.object_id)
             state.reset_runtime()
+            self.pose_cache.clear()
+            if not any(candidate.valid for candidate in self.object_states):
+                self.last_tracking_timestamp = None
+            self.ui_message = f"Reset {state.spec.object_id}; press i to initialize"
         elif key == ord("a"):
             _logger.info("Resetting all objects")
             for state in self.object_states:
                 state.reset_runtime()
             self.current_object_idx = 0
-        elif key == ord("i") and self.latest_frame is not None:
-            self._init_object(self.object_states[self.current_object_idx], self.latest_frame)
-
-    def _maybe_auto_init(self) -> None:
-        if self.latest_frame is None:
-            return
-        for idx, state in enumerate(self.object_states):
-            if state.state == "uninitialized" and not state.meta.get("init_attempted"):
-                self.current_object_idx = idx
-                self._init_object(state, self.latest_frame)
-                break
+            self.pose_cache.clear()
+            self.last_tracking_timestamp = None
+            self.ui_message = "Reset all objects; select one and press i to initialize"
+        elif key == ord("i"):
+            self._start_init_interaction()
+        self._ui_dirty = True
 
     def run(self) -> None:
         _logger.info("Object pose server started")
         _logger.info("Subscribed to sync channel: %s", self.sync_channel)
         _logger.info("Publishing object poses on: %s", self.pub_channel)
+        _logger.info("Replying to priority pose requests on: %s", self.request_channel)
+        _logger.info(
+            "Background tracking target: %.2f FPS; timestamp tolerance: %.1f ms",
+            self.background_fps,
+            self.timestamp_tolerance * 1000.0,
+        )
+        self._create_window()
+        self._maybe_start_sam_api()
+        self._start_cache_thread()
+        next_background_time = time.monotonic()
+        last_live_display_timestamp: Optional[float] = None
 
         while not self.shutdown:
-            start = time.time()
-            socks = dict(self.poller.poll(timeout=10))
-            if self.sync_socket in socks:
-                msg = self.sync_socket.recv(zmq.NOBLOCK)
-                frame = self._decode_sync_message(msg)
-                if frame is not None:
-                    self.latest_frame = frame
-                    self._maybe_auto_init()
-                    for state in self.object_states:
-                        self._track_object(state, frame)
-                    self._publish(frame.sync_timestamp, time.time() - start)
-                    self._draw_status(frame)
+            latest_frame = self.frame_cache.latest()
+            if latest_frame is not None:
+                self.latest_frame = latest_frame
+                if (self.init_interaction is None and
+                        latest_frame.sync_timestamp != last_live_display_timestamp):
+                    self._ui_dirty = True
+                    last_live_display_timestamp = latest_frame.sync_timestamp
 
-            key = cv2.waitKey(1)
-            self._handle_key(key)
+            # A request already waiting always wins over starting new background work.
+            events = dict(self.poller.poll(timeout=10))
+            if self.request_socket in events:
+                request = self.request_socket.recv()
+                response = self._handle_pose_request(request)
+                self.request_socket.send(msgpack.packb(response, default=msgpack_numpy.encode))
+                # Avoid an immediate background call after request inference. There is no
+                # catch-up queue: the next pass will use the newest camera frame.
+                next_background_time = max(
+                    next_background_time,
+                    time.monotonic() + self.background_interval,
+                )
+                self._ui_dirty = True
+                if self._ui_dirty:
+                    self._redraw_ui()
+                self._pump_ui()
+                if self._ui_dirty:
+                    self._redraw_ui()
+                continue
+
+            now = time.monotonic()
+            if now >= next_background_time:
+                background_started = now
+                frame = self.frame_cache.latest()
+                if (frame is not None and any(state.valid for state in self.object_states) and
+                        (self.last_tracking_timestamp is None or
+                         frame.sync_timestamp > self.last_tracking_timestamp + self.timestamp_tolerance)):
+                    self.latest_frame = frame
+                    packet = self._process_tracking_frame(frame, publish=True)
+                    _logger.info(
+                        "Background pose %.6f in %.1f ms",
+                        frame.sync_timestamp,
+                        float(packet["process_time"]) * 1000.0,
+                    )
+                    self._ui_dirty = True
+
+                # Start-to-start limiting without replaying missed periods.
+                next_background_time = max(
+                    background_started + self.background_interval,
+                    time.monotonic(),
+                )
+
+            if self._ui_dirty:
+                self._redraw_ui()
+            self._pump_ui()
+            if self._ui_dirty:
+                self._redraw_ui()
 
 
 def load_object_specs(path: str) -> List[ObjectSpec]:
@@ -1146,6 +1687,7 @@ def main() -> None:
     parser.add_argument("--server.video_shape", type=parse_video_shape, default="1280x720")
     parser.add_argument("--server.sync_channel", type=str, required=True)
     parser.add_argument("--server.pub_channel", type=str, required=True)
+    parser.add_argument("--server.request_channel", type=str, default="tcp://*:9671")
     parser.add_argument("--camera_info", type=parse_camera_info, required=True)
     parser.add_argument("--calib_filedir", type=str, required=True)
     parser.add_argument(
@@ -1182,6 +1724,9 @@ def main() -> None:
     parser.add_argument("--sam_api_startup_timeout", type=float, default=120.0)
     parser.add_argument("--display_scale", type=float, default=0.75)
     parser.add_argument("--debug", type=int, default=0)
+    parser.add_argument("--background_fps", type=float, default=5.0)
+    parser.add_argument("--cache_size", type=int, default=30)
+    parser.add_argument("--timestamp_tolerance_ms", type=float, default=5.0)
     args = parser.parse_args()
 
     object_specs = load_object_specs(args.object_config)
@@ -1189,6 +1734,7 @@ def main() -> None:
         video_shape=getattr(args, "server.video_shape"),
         sync_channel=getattr(args, "server.sync_channel"),
         pub_channel=getattr(args, "server.pub_channel"),
+        request_channel=getattr(args, "server.request_channel"),
         camera_info=args.camera_info,
         calib_filedir=os.path.abspath(os.path.expanduser(args.calib_filedir)),
         world_calib=args.world_calib,
@@ -1207,6 +1753,9 @@ def main() -> None:
         sam_api_startup_timeout=args.sam_api_startup_timeout,
         display_scale=args.display_scale,
         debug=args.debug,
+        background_fps=args.background_fps,
+        cache_size=args.cache_size,
+        timestamp_tolerance_ms=args.timestamp_tolerance_ms,
     )
 
     def _signal_handler(signum, _frame):

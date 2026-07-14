@@ -14,6 +14,10 @@ export TMPDIR="$SCRIPT_DIR/tmp"
 
 SYNC_CHANNEL="${SYNC_CHANNEL:-tcp://localhost:9600}"
 PUB_CHANNEL="${PUB_CHANNEL:-tcp://*:9670}"
+REQUEST_CHANNEL="${REQUEST_CHANNEL:-tcp://*:9671}"
+BACKGROUND_FPS="${BACKGROUND_FPS:-5.0}"
+CACHE_SIZE="${CACHE_SIZE:-30}"
+TIMESTAMP_TOLERANCE_MS="${TIMESTAMP_TOLERANCE_MS:-5.0}"
 OBJECT_CONFIG="${OBJECT_CONFIG:-$SCRIPT_DIR/tmp/object_config/Pipette #1.yml}"
 CALIB_FILEDIR="${CALIB_FILEDIR:-$SCRIPT_DIR/../common/calib_camera}"
 CAMERA_INFO="${CAMERA_INFO:-236422071710=camera_top}"
@@ -40,6 +44,7 @@ exec python server.py \
   --server.video_shape "$VIDEO_SHAPE" \
   --server.sync_channel "$SYNC_CHANNEL" \
   --server.pub_channel "$PUB_CHANNEL" \
+  --server.request_channel "$REQUEST_CHANNEL" \
   --camera_info "$CAMERA_INFO" \
   --calib_filedir "$CALIB_FILEDIR" \
   "${WORLD_CALIB_ARGS[@]}" \
@@ -53,4 +58,7 @@ exec python server.py \
   --sam_api_model_type "$SAM_API_MODEL_TYPE" \
   --sam_api_startup_timeout "$SAM_API_STARTUP_TIMEOUT" \
   --display_scale "$DISPLAY_SCALE" \
-  --internal_height 480
+  --internal_height 480 \
+  --background_fps "$BACKGROUND_FPS" \
+  --cache_size "$CACHE_SIZE" \
+  --timestamp_tolerance_ms "$TIMESTAMP_TOLERANCE_MS"
