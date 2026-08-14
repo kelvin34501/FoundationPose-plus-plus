@@ -359,6 +359,7 @@ class ObjectState:
     kf_covariance: Optional[np.ndarray] = None
     init_mask: Optional[np.ndarray] = None
     last_mask: Optional[np.ndarray] = None
+    last_mask_synced_ts: Optional[float] = None
     last_T_camera_object: Optional[np.ndarray] = None
     last_T_world_object: Optional[np.ndarray] = None
     last_score: Optional[float] = None
@@ -367,8 +368,8 @@ class ObjectState:
 
     @property
     def valid(self) -> bool:
-        return (self.state == "tracking" and self.last_T_camera_object is not None
-                and self.last_T_world_object is not None)
+        return (self.state == "tracking" and self.last_T_camera_object is not None and
+                self.last_T_world_object is not None)
 
     def reset_runtime(self) -> None:
         self.state = "uninitialized"
@@ -380,6 +381,7 @@ class ObjectState:
         self.kf_covariance = None
         self.init_mask = None
         self.last_mask = None
+        self.last_mask_synced_ts = None
         self.last_T_camera_object = None
         self.last_T_world_object = None
         self.last_score = None
@@ -504,8 +506,7 @@ class ObjectPoseServer:
         if not np.isfinite(background_fps) or background_fps <= 0.0:
             raise ValueError(f"background_fps must be positive and finite, got {background_fps}")
         if not np.isfinite(timestamp_tolerance_ms) or timestamp_tolerance_ms < 0.0:
-            raise ValueError(
-                f"timestamp_tolerance_ms must be non-negative and finite, got {timestamp_tolerance_ms}")
+            raise ValueError(f"timestamp_tolerance_ms must be non-negative and finite, got {timestamp_tolerance_ms}")
         self.background_fps = float(background_fps)
         self.background_interval = 1.0 / self.background_fps
         self.timestamp_tolerance = float(timestamp_tolerance_ms) / 1000.0
@@ -738,8 +739,7 @@ class ObjectPoseServer:
     @staticmethod
     def _available_init_cameras(frame: SyncFrame) -> List[str]:
         return [
-            camera_name
-            for camera_name in frame.color_by_camera
+            camera_name for camera_name in frame.color_by_camera
             if camera_name in frame.depth_by_camera and camera_name in frame.cam_intr_by_camera
         ]
 
@@ -901,7 +901,12 @@ class ObjectPoseServer:
                 parsed_endpoint.scheme,
                 parsed_endpoint.netloc,
                 parsed_endpoint.path.rstrip("/") + "/binary",
-                urllib.parse.urlencode({"x": x, "y": y, "w": width, "h": height}),
+                urllib.parse.urlencode({
+                    "x": x,
+                    "y": y,
+                    "w": width,
+                    "h": height
+                }),
                 parsed_endpoint.fragment,
             ))
             payload = frame_png.tobytes()
@@ -1036,7 +1041,11 @@ class ObjectPoseServer:
                 state.tracker_2d = Tracker_2D()
             # Capture the init mask from Cutie for visualization overlay
             if (hasattr(state.tracker_2d, 'last_mask') and state.tracker_2d.last_mask is not None):
-                state.last_mask = state.tracker_2d.last_mask.copy()
+                state.last_mask = np.ascontiguousarray(
+                    np.asarray(state.tracker_2d.last_mask) > 0,
+                    dtype=np.uint8,
+                )
+                state.last_mask_synced_ts = float(frame.sync_timestamp)
             if self.activate_kalman_filter:
                 state.kalman_filter = KalmanFilter6D(self.kf_measurement_noise_scale)
                 state.kf_mean, state.kf_covariance = state.kalman_filter.initiate(get_6d_pose_arr_from_mat(pose_cam))
@@ -1084,8 +1093,16 @@ class ObjectPoseServer:
             if self.activate_2d_tracker and state.tracker_2d is not None:
                 bbox = state.tracker_2d.track(color)
                 # Collect the tracking mask for visualization
-                if hasattr(state.tracker_2d, 'last_mask') and state.tracker_2d.last_mask is not None:
-                    state.last_mask = state.tracker_2d.last_mask.copy()
+                tracker_mask = getattr(state.tracker_2d, "last_mask", None)
+                if tracker_mask is None:
+                    state.last_mask = None
+                    state.last_mask_synced_ts = None
+                else:
+                    state.last_mask = np.ascontiguousarray(
+                        np.asarray(tracker_mask) > 0,
+                        dtype=np.uint8,
+                    )
+                    state.last_mask_synced_ts = float(frame.sync_timestamp)
                 if bbox[0] >= 0 and bbox[1] >= 0 and state.estimator.pose_last is not None:
                     cx = bbox[0] + bbox[2] / 2.0
                     cy = bbox[1] + bbox[3] / 2.0
@@ -1133,7 +1150,25 @@ class ObjectPoseServer:
             _logger.exception("Tracking failed for %s", state.spec.object_id)
 
     @staticmethod
-    def _state_object_payload(state: ObjectState) -> Dict[str, Any]:
+    def _state_object_payload(
+        state: ObjectState,
+        *,
+        expected_mask_synced_ts: Optional[float] = None,
+        unavailable_mask_state: str = "mask_missing",
+    ) -> Dict[str, Any]:
+        tracking_mask = None
+        tracking_mask_synced_ts = None
+        tracking_mask_state = unavailable_mask_state
+        if expected_mask_synced_ts is not None:
+            if (state.last_mask is not None and state.last_mask_synced_ts is not None and
+                    state.last_mask_synced_ts == expected_mask_synced_ts):
+                tracking_mask = np.ascontiguousarray(state.last_mask, dtype=np.uint8).copy()
+                tracking_mask_synced_ts = float(state.last_mask_synced_ts)
+                tracking_mask_state = "available"
+            elif state.last_mask is not None and state.last_mask_synced_ts is not None:
+                # Never attach a mask from another frame to this pose packet.
+                tracking_mask_synced_ts = float(state.last_mask_synced_ts)
+                tracking_mask_state = "mask_stale"
         return {
             "object_id": state.spec.object_id,
             "T_camera_object": state.last_T_camera_object,
@@ -1142,9 +1177,14 @@ class ObjectPoseServer:
             "state": state.state,
             "score": state.last_score,
             "source_camera": state.source_camera,
+            "tracking_mask": tracking_mask,
+            "tracking_mask_synced_ts": tracking_mask_synced_ts,
+            "tracking_mask_state": tracking_mask_state,
             "meta": {
                 **state.meta,
-                **({"error": state.error_msg} if state.error_msg else {}),
+                **({
+                    "error": state.error_msg
+                } if state.error_msg else {}),
             },
         }
 
@@ -1157,8 +1197,12 @@ class ObjectPoseServer:
         return {
             "sync_timestamp": sync_timestamp,
             "server_timestamp": time.time(),
-            "object_poses": (object_payloads if object_payloads is not None else
-                             [self._state_object_payload(state) for state in self.object_states]),
+            "object_poses": (object_payloads if object_payloads is not None else [
+                self._state_object_payload(
+                    state,
+                    expected_mask_synced_ts=sync_timestamp,
+                ) for state in self.object_states
+            ]),
             "process_time": process_time,
         }
 
@@ -1182,7 +1226,11 @@ class ObjectPoseServer:
         object_payloads: List[Dict[str, Any]] = []
         for state in self.object_states:
             if not state.valid or state.estimator is None or state.source_camera is None:
-                object_payloads.append(self._state_object_payload(state))
+                object_payloads.append(
+                    self._state_object_payload(
+                        state,
+                        unavailable_mask_state="mask_unavailable_isolated",
+                    ))
                 continue
 
             camera_name = state.source_camera
@@ -1190,8 +1238,7 @@ class ObjectPoseServer:
             depth = frame.depth_by_camera.get(camera_name)
             cam_K = frame.cam_intr_by_camera.get(camera_name)
             if color is None or depth is None or cam_K is None:
-                raise RuntimeError(
-                    f"Requested frame is missing RGB-D or intrinsics for camera {camera_name}")
+                raise RuntimeError(f"Requested frame is missing RGB-D or intrinsics for camera {camera_name}")
             pose_last = state.estimator.pose_last
             if pose_last is None:
                 raise RuntimeError(f"Object {state.spec.object_id} has no pose seed")
@@ -1220,7 +1267,12 @@ class ObjectPoseServer:
                 "state": "tracking",
                 "score": state.last_score,
                 "source_camera": camera_name,
-                "meta": {**state.meta, "request_processing": "isolated"},
+                "tracking_mask": None,
+                "tracking_mask_synced_ts": None,
+                "tracking_mask_state": "mask_unavailable_isolated",
+                "meta": {
+                    **state.meta, "request_processing": "isolated"
+                },
             })
 
         packet = self._make_pose_packet(
@@ -1240,7 +1292,10 @@ class ObjectPoseServer:
     ) -> Dict[str, Any]:
         response: Dict[str, Any] = {
             "ok": False,
-            "error": {"code": code, "message": message},
+            "error": {
+                "code": code,
+                "message": message
+            },
             "server_timestamp": time.time(),
         }
         if requested_synced_ts is not None:
@@ -1590,8 +1645,7 @@ class ObjectPoseServer:
             latest_frame = self.frame_cache.latest()
             if latest_frame is not None:
                 self.latest_frame = latest_frame
-                if (self.init_interaction is None and
-                        latest_frame.sync_timestamp != last_live_display_timestamp):
+                if (self.init_interaction is None and latest_frame.sync_timestamp != last_live_display_timestamp):
                     self._ui_dirty = True
                     last_live_display_timestamp = latest_frame.sync_timestamp
 
@@ -1620,8 +1674,8 @@ class ObjectPoseServer:
                 background_started = now
                 frame = self.frame_cache.latest()
                 if (frame is not None and any(state.valid for state in self.object_states) and
-                        (self.last_tracking_timestamp is None or
-                         frame.sync_timestamp > self.last_tracking_timestamp + self.timestamp_tolerance)):
+                    (self.last_tracking_timestamp is None or
+                     frame.sync_timestamp > self.last_tracking_timestamp + self.timestamp_tolerance)):
                     self.latest_frame = frame
                     packet = self._process_tracking_frame(frame, publish=True)
                     _logger.info(
