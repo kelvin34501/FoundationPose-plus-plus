@@ -20,7 +20,9 @@ CACHE_SIZE="${CACHE_SIZE:-30}"
 TIMESTAMP_TOLERANCE_MS="${TIMESTAMP_TOLERANCE_MS:-5.0}"
 OBJECT_CONFIG="${OBJECT_CONFIG:-$SCRIPT_DIR/tmp/object_config/Pipette #1.yml}"
 CALIB_FILEDIR="${CALIB_FILEDIR:-$SCRIPT_DIR/../common/calib_camera}"
-CAMERA_INFO="${CAMERA_INFO:-236422071710=camera_top}"
+CAMERA_INFO="${CAMERA_INFO:-420222072510=camera_top,920312072027=camera_lowfield_1}"
+OBSERVATION_CAMERA="${OBSERVATION_CAMERA:-camera_lowfield_1}"
+EXPRESSION_CAMERA="${EXPRESSION_CAMERA:-camera_top}"
 VIDEO_SHAPE="${VIDEO_SHAPE:-1280x720}"
 DISPLAY_SCALE="${DISPLAY_SCALE:-1.0}"
 SAM_API_ENDPOINT="${SAM_API_ENDPOINT:-http://localhost:9002/hq_sam}"
@@ -46,6 +48,8 @@ exec python server.py \
   --server.pub_channel "$PUB_CHANNEL" \
   --server.request_channel "$REQUEST_CHANNEL" \
   --camera_info "$CAMERA_INFO" \
+  --observation_camera "$OBSERVATION_CAMERA" \
+  --expression_camera "$EXPRESSION_CAMERA" \
   --calib_filedir "$CALIB_FILEDIR" \
   "${WORLD_CALIB_ARGS[@]}" \
   --object_config "$OBJECT_CONFIG" \

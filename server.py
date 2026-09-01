@@ -56,7 +56,10 @@ if FOUNDATIONPOSE_DIR not in sys.path:
 
 from VOT import Cutie, Tracker_2D  # noqa: E402
 from utils.kalman_filter_6d import KalmanFilter6D  # noqa: E402
-from world_calibration import load_fixed_camera_calibrations  # noqa: E402
+from world_calibration import (  # noqa: E402
+    express_world_pose_in_camera,
+    load_fixed_camera_calibrations,
+)
 
 _logger = logging.getLogger("object_pose_server")
 WINDOW_NAME = "object_pose_server"
@@ -360,6 +363,7 @@ class ObjectState:
     init_mask: Optional[np.ndarray] = None
     last_mask: Optional[np.ndarray] = None
     last_mask_synced_ts: Optional[float] = None
+    # Estimator pose in source_camera; publication may express it in another camera.
     last_T_camera_object: Optional[np.ndarray] = None
     last_T_world_object: Optional[np.ndarray] = None
     last_score: Optional[float] = None
@@ -461,6 +465,8 @@ class ObjectPoseServer:
         camera_info: Dict[str, str],
         calib_filedir: str,
         world_calib: Optional[str],
+        observation_camera: Optional[str],
+        expression_camera: Optional[str],
         object_specs: List[ObjectSpec],
         est_refine_iter: int,
         track_refine_iter: int,
@@ -486,6 +492,17 @@ class ObjectPoseServer:
         self.request_channel = request_channel
         self.camera_info = camera_info
         self.camera_name_list = list(camera_info.values())
+        self.observation_camera = observation_camera
+        self.expression_camera = expression_camera or observation_camera
+        for option_name, camera_name in (
+            ("observation_camera", self.observation_camera),
+            ("expression_camera", self.expression_camera),
+        ):
+            if camera_name is not None and camera_name not in self.camera_name_list:
+                raise ValueError(
+                    f"{option_name} {camera_name!r} is not present in camera_info: "
+                    f"{self.camera_name_list}"
+                )
         self.calib_filedir = calib_filedir
         self.est_refine_iter = est_refine_iter
         self.track_refine_iter = track_refine_iter
@@ -523,7 +540,9 @@ class ObjectPoseServer:
         self.cache_thread: Optional[threading.Thread] = None
         self.last_tracking_timestamp: Optional[float] = None
         self.init_interaction: Optional[InitInteraction] = None
-        self.selected_camera_by_object: Dict[int, str] = {}
+        # GUI view selection is independent from the RGB-D camera used to
+        # initialize and track each object.
+        self.selected_view_camera_by_object: Dict[int, str] = {}
         self.ui_message: Optional[str] = None
         self._ui_dirty = True
         self._window_created = False
@@ -532,6 +551,11 @@ class ObjectPoseServer:
         self.cam_intr_map = self._load_intrinsics()
         fixed_camera_calibration = load_fixed_camera_calibrations(world_calib, self.camera_name_list)
         self.T_world_camera_map = fixed_camera_calibration.T_world_camera_by_name
+        _logger.info(
+            "Camera frames: observation=%s expression=%s",
+            self.observation_camera or "per-object/interactive",
+            self.expression_camera or "observation camera",
+        )
 
         self.ctx = zmq.Context()
 
@@ -560,6 +584,31 @@ class ObjectPoseServer:
             with open(path, "rb") as f:
                 result[camera_name] = np.asarray(pickle.load(f), dtype=np.float64)
         return result
+
+    def _pose_camera_for_state(self, state: ObjectState) -> Optional[str]:
+        return self.expression_camera or state.source_camera
+
+    def _camera_pose_for_payload(
+        self,
+        state: ObjectState,
+    ) -> Tuple[Optional[str], Optional[np.ndarray]]:
+        pose_camera = self._pose_camera_for_state(state)
+        return pose_camera, self._pose_for_camera(state, pose_camera)
+
+    def _pose_for_camera(
+        self,
+        state: ObjectState,
+        camera_name: Optional[str],
+    ) -> Optional[np.ndarray]:
+        """Express the latest tracked pose in ``camera_name`` for output or display."""
+        if camera_name is None or state.last_T_world_object is None:
+            return None
+        if camera_name == state.source_camera and state.last_T_camera_object is not None:
+            return state.last_T_camera_object
+        T_world_camera = self.T_world_camera_map.get(camera_name)
+        if T_world_camera is None:
+            return None
+        return express_world_pose_in_camera(T_world_camera, state.last_T_world_object)
 
     def close(self) -> None:
         if self._closed:
@@ -743,42 +792,62 @@ class ObjectPoseServer:
             if camera_name in frame.depth_by_camera and camera_name in frame.cam_intr_by_camera
         ]
 
+    @staticmethod
+    def _available_view_cameras(frame: SyncFrame) -> List[str]:
+        return [
+            camera_name for camera_name in frame.color_by_camera
+            if camera_name in frame.cam_intr_by_camera
+        ]
+
     def _preview_camera(self, frame: SyncFrame) -> Optional[str]:
         state = self.object_states[self.current_object_idx]
-        if state.source_camera in frame.color_by_camera:
-            return state.source_camera
-        if state.spec.camera_name:
-            return state.spec.camera_name if state.spec.camera_name in frame.color_by_camera else None
-
-        available = self._available_init_cameras(frame)
+        available = self._available_view_cameras(frame)
         if not available:
             return next(iter(frame.color_by_camera), None)
-        selected = self.selected_camera_by_object.get(self.current_object_idx)
-        if selected not in available:
-            selected = available[0]
-            self.selected_camera_by_object[self.current_object_idx] = selected
-        return selected
 
-    def _cycle_init_camera(self, delta: int) -> None:
+        selected = self.selected_view_camera_by_object.get(self.current_object_idx)
+        if selected in available:
+            return selected
+
+        preferred = (
+            state.source_camera,
+            self.observation_camera,
+            state.spec.camera_name,
+        )
+        fallback = next((name for name in preferred if name in available), available[0])
+        if selected is None:
+            self.selected_view_camera_by_object[self.current_object_idx] = fallback
+        return fallback
+
+    def _initialization_camera(self, frame: SyncFrame) -> Optional[str]:
+        state = self.object_states[self.current_object_idx]
+        if self.observation_camera:
+            return self.observation_camera
+        if state.spec.camera_name:
+            return state.spec.camera_name
+        return self._preview_camera(frame)
+
+    def _cycle_display_camera(self, delta: int) -> None:
         if self.latest_frame is None:
-            self.ui_message = "No synchronized RGB-D frame is available"
+            self.ui_message = "No synchronized camera frame is available"
             return
         state = self.object_states[self.current_object_idx]
-        if state.spec.camera_name:
-            self.ui_message = f"Camera is pinned to {state.spec.camera_name} by object config"
-            return
-        if state.source_camera:
-            self.ui_message = "Reset the tracked object before changing its initialization camera"
-            return
-        available = self._available_init_cameras(self.latest_frame)
+        available = self._available_view_cameras(self.latest_frame)
         if not available:
-            self.ui_message = "No camera currently has synchronized RGB-D data"
+            self.ui_message = "No camera currently has synchronized color and intrinsics"
             return
-        current = self.selected_camera_by_object.get(self.current_object_idx, available[0])
+        current = self._preview_camera(self.latest_frame)
         current_idx = available.index(current) if current in available else 0
         selected = available[(current_idx + delta) % len(available)]
-        self.selected_camera_by_object[self.current_object_idx] = selected
-        self.ui_message = f"Selected initialization camera: {selected}"
+        self.selected_view_camera_by_object[self.current_object_idx] = selected
+        if state.source_camera:
+            self.ui_message = f"View camera: {selected}; tracking remains on {state.source_camera}"
+        else:
+            init_camera = self.observation_camera or state.spec.camera_name
+            if init_camera:
+                self.ui_message = f"View camera: {selected}; initialization uses {init_camera}"
+            else:
+                self.ui_message = f"Selected initialization/view camera: {selected}"
 
     def _start_init_interaction(self) -> None:
         if self.latest_frame is None:
@@ -788,7 +857,7 @@ class ObjectPoseServer:
         if state.state != "uninitialized":
             self.ui_message = f"Reset {state.spec.object_id} before initializing it again"
             return
-        camera_name = self._preview_camera(self.latest_frame)
+        camera_name = self._initialization_camera(self.latest_frame)
         if (camera_name is None or camera_name not in self.latest_frame.color_by_camera or
                 camera_name not in self.latest_frame.depth_by_camera or
                 camera_name not in self.latest_frame.cam_intr_by_camera):
@@ -1149,8 +1218,8 @@ class ObjectPoseServer:
             state.error_msg = str(exc)
             _logger.exception("Tracking failed for %s", state.spec.object_id)
 
-    @staticmethod
     def _state_object_payload(
+        self,
         state: ObjectState,
         *,
         expected_mask_synced_ts: Optional[float] = None,
@@ -1169,14 +1238,16 @@ class ObjectPoseServer:
                 # Never attach a mask from another frame to this pose packet.
                 tracking_mask_synced_ts = float(state.last_mask_synced_ts)
                 tracking_mask_state = "mask_stale"
+        pose_camera, T_camera_object = self._camera_pose_for_payload(state)
         return {
             "object_id": state.spec.object_id,
-            "T_camera_object": state.last_T_camera_object,
+            "T_camera_object": T_camera_object,
             "T_world_object": state.last_T_world_object,
             "valid": state.valid,
             "state": state.state,
             "score": state.last_score,
             "source_camera": state.source_camera,
+            "pose_camera": pose_camera,
             "tracking_mask": tracking_mask,
             "tracking_mask_synced_ts": tracking_mask_synced_ts,
             "tracking_mask_state": tracking_mask_state,
@@ -1257,8 +1328,17 @@ class ObjectPoseServer:
                 # rewind the state consumed by Cutie, Kalman, or background tracking.
                 state.estimator.pose_last = pose_last
 
-            T_camera_object = np.asarray(pose_cam, dtype=np.float64)
-            T_world_object = self.T_world_camera_map[camera_name] @ T_camera_object
+            T_observation_camera_object = np.asarray(pose_cam, dtype=np.float64)
+            T_world_object = self.T_world_camera_map[camera_name] @ T_observation_camera_object
+            pose_camera = self.expression_camera or camera_name
+            T_camera_object = (
+                T_observation_camera_object
+                if pose_camera == camera_name
+                else express_world_pose_in_camera(
+                    self.T_world_camera_map[pose_camera],
+                    T_world_object,
+                )
+            )
             object_payloads.append({
                 "object_id": state.spec.object_id,
                 "T_camera_object": T_camera_object,
@@ -1267,6 +1347,7 @@ class ObjectPoseServer:
                 "state": "tracking",
                 "score": state.last_score,
                 "source_camera": camera_name,
+                "pose_camera": pose_camera,
                 "tracking_mask": None,
                 "tracking_mask_synced_ts": None,
                 "tracking_mask_state": "mask_unavailable_isolated",
@@ -1435,14 +1516,17 @@ class ObjectPoseServer:
         # --- Draw pose axes ---
         if cam_K is not None:
             for i, state in enumerate(self.object_states):
-                if state.source_camera != camera_name or state.last_T_camera_object is None or not state.valid:
+                if not state.valid:
+                    continue
+                T_camera_object = self._pose_for_camera(state, camera_name)
+                if T_camera_object is None:
                     continue
                 axis_scale = 0.08
                 if state.mesh is not None:
                     axis_scale = float(np.clip(state.mesh.extents.max() * 0.35, 0.03, 0.20))
                 disp = draw_pose_frame_bgr(
                     disp,
-                    state.last_T_camera_object,
+                    T_camera_object,
                     cam_K,
                     axis_scale=axis_scale,
                     thickness=4 if i == self.current_object_idx else 2,
@@ -1463,9 +1547,11 @@ class ObjectPoseServer:
 
         y = 24
         mode = interaction.mode if interaction is not None else "idle"
+        current_state = self.object_states[self.current_object_idx]
+        tracking_camera = current_state.source_camera or "-"
         cv2.putText(
             disp,
-            f"camera={camera_name} sync={frame.sync_timestamp:.3f} mode={mode}",
+            f"view={camera_name} tracking={tracking_camera} sync={frame.sync_timestamp:.3f} mode={mode}",
             (10, y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -1482,7 +1568,7 @@ class ObjectPoseServer:
             y += 24
         y += 6
         if interaction is None:
-            controls = "[/]: object  ,/.: camera  i:init  r:reset current  a:reset all  q:quit"
+            controls = "[/]: object  ,/.: view  i:init  r:reset current  a:reset all  q:quit"
         elif interaction.mode == "roi":
             controls = "mouse drag: ROI  Enter/Space: segment  c/Esc: cancel"
         elif interaction.mode == "mask":
@@ -1602,9 +1688,9 @@ class ObjectPoseServer:
             self.current_object_idx = (self.current_object_idx + 1) % len(self.object_states)
             self.ui_message = f"Selected object: {self.object_states[self.current_object_idx].spec.object_id}"
         elif key == ord(","):
-            self._cycle_init_camera(-1)
+            self._cycle_display_camera(-1)
         elif key == ord("."):
-            self._cycle_init_camera(1)
+            self._cycle_display_camera(1)
         elif key == ord("r"):
             state = self.object_states[self.current_object_idx]
             _logger.info("Resetting object %s", state.spec.object_id)
@@ -1750,6 +1836,18 @@ def main() -> None:
         default=None,
         help="Optional calibration session or world directory; defaults to the latest calib__* session",
     )
+    parser.add_argument(
+        "--observation_camera",
+        type=str,
+        default=None,
+        help="Optional server-wide RGB-D camera used to initialize and track every object",
+    )
+    parser.add_argument(
+        "--expression_camera",
+        type=str,
+        default=None,
+        help="Optional camera frame for published T_camera_object; defaults to the observation camera",
+    )
     parser.add_argument("--object_config", type=str, required=True)
     parser.add_argument("--est_refine_iter", type=int, default=10)
     parser.add_argument("--track_refine_iter", type=int, default=5)
@@ -1792,6 +1890,8 @@ def main() -> None:
         camera_info=args.camera_info,
         calib_filedir=os.path.abspath(os.path.expanduser(args.calib_filedir)),
         world_calib=args.world_calib,
+        observation_camera=args.observation_camera,
+        expression_camera=args.expression_camera,
         object_specs=object_specs,
         est_refine_iter=args.est_refine_iter,
         track_refine_iter=args.track_refine_iter,

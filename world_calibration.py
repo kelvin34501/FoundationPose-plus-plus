@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import pickle
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -14,6 +15,11 @@ import numpy as np
 _LOGGER = logging.getLogger("world_calibration")
 DEX_MANIP_ROOT = Path(__file__).resolve().parent.parent
 CALIBRATION_ROOT = DEX_MANIP_ROOT / "common" / "calib_camera" / "checkerboard_calib"
+EASYROBOT_SRC = DEX_MANIP_ROOT / "easyrobot_custom" / "src"
+if str(EASYROBOT_SRC) not in sys.path:
+    sys.path.insert(0, str(EASYROBOT_SRC))
+
+from dev_fn.transform.transform_np import inv_transf_np  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -23,6 +29,14 @@ class FixedCameraCalibration:
     session_dir: Path
     world_dir: Path
     camera_pickles: Dict[str, Path]
+
+
+def express_world_pose_in_camera(
+    T_world_camera: np.ndarray,
+    T_world_object: np.ndarray,
+) -> np.ndarray:
+    """Express a world-frame object pose in a fixed camera frame."""
+    return inv_transf_np(np.asarray(T_world_camera)) @ np.asarray(T_world_object)
 
 
 def _select_session(world_calib: Optional[str]):
