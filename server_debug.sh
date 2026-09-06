@@ -18,6 +18,11 @@ REQUEST_CHANNEL="${REQUEST_CHANNEL:-tcp://*:9671}"
 BACKGROUND_FPS="${BACKGROUND_FPS:-7.5}"
 CACHE_SIZE="${CACHE_SIZE:-30}"
 TIMESTAMP_TOLERANCE_MS="${TIMESTAMP_TOLERANCE_MS:-5.0}"
+POSE_MIN_MASK_IOU="${POSE_MIN_MASK_IOU:-0.40}"
+POSE_MAX_DEPTH_ERROR_M="${POSE_MAX_DEPTH_ERROR_M:-0.02}"
+POSE_MIN_DEPTH_INLIER_FRACTION="${POSE_MIN_DEPTH_INLIER_FRACTION:-0.70}"
+POSE_MAX_TRANSLATION_JUMP_M="${POSE_MAX_TRANSLATION_JUMP_M:-0.05}"
+POSE_MAX_ROTATION_JUMP_DEG="${POSE_MAX_ROTATION_JUMP_DEG:-30.0}"
 OBJECT_CONFIG="${OBJECT_CONFIG:-$SCRIPT_DIR/tmp/object_config/Pipette #1.yml}"
 CALIB_FILEDIR="${CALIB_FILEDIR:-$SCRIPT_DIR/../common/calib_camera}"
 CAMERA_INFO="${CAMERA_INFO:-420222072510=camera_top,920312072027=camera_lowfield_1}"
@@ -65,4 +70,9 @@ exec python server.py \
   --internal_height 480 \
   --background_fps "$BACKGROUND_FPS" \
   --cache_size "$CACHE_SIZE" \
-  --timestamp_tolerance_ms "$TIMESTAMP_TOLERANCE_MS"
+  --timestamp_tolerance_ms "$TIMESTAMP_TOLERANCE_MS" \
+  --pose_min_mask_iou "$POSE_MIN_MASK_IOU" \
+  --pose_max_depth_error_m "$POSE_MAX_DEPTH_ERROR_M" \
+  --pose_min_depth_inlier_fraction "$POSE_MIN_DEPTH_INLIER_FRACTION" \
+  --pose_max_translation_jump_m "$POSE_MAX_TRANSLATION_JUMP_M" \
+  --pose_max_rotation_jump_deg "$POSE_MAX_ROTATION_JUMP_DEG"

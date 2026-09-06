@@ -1,5 +1,46 @@
 # FoundationPose++: Simple Tricks Boost FoundationPose Performance in High-Dynamic Scenes
 
+## Live server pose validity
+
+`server.py` validates registration, background tracking, and timestamped
+requests before publishing `valid=true`. The default acceptance limits are:
+
+| Check | Default | `server_debug.sh` environment variable |
+| --- | --- | --- |
+| Rendered mesh / current tracking mask IoU | at least 0.40 | `POSE_MIN_MASK_IOU` |
+| Rendered / observed depth error | at most 0.02 m | `POSE_MAX_DEPTH_ERROR_M` |
+| Rendered pixels with matching observed depth | at least 70% | `POSE_MIN_DEPTH_INLIER_FRACTION` |
+| Translation from last accepted pose | at most 0.05 m | `POSE_MAX_TRANSLATION_JUMP_M` |
+| Relative rotation from last accepted pose | at most 30 degrees | `POSE_MAX_ROTATION_JUMP_DEG` |
+
+Poses must also be finite rigid transforms, with at least 64 rendered pixels
+and 64 matching depth pixels. Masks, when checked, need at least 64 foreground
+pixels. Missing depth and occluded pixels count against depth agreement. These
+checks use the observation camera, before expressing the pose in another
+camera. They add one mesh render per candidate pose; live GPU timing has not
+yet been measured for these defaults.
+
+Initialization requires its accepted segmentation mask; tracking with Cutie
+enabled requires a mask from the current frame. Historical isolated requests
+cannot rewind Cutie, so they use their own frame's depth and the motion limits
+without reusing a newer mask. Tracking with the 2D tracker disabled also uses
+depth and motion checks. The motion limits are absolute changes from the last
+accepted pose, not velocities; large movements or long gaps can require
+reinitialization or larger limits.
+
+A rejected candidate is published as `valid=false`, `state=rejected`, with
+measurements and a reason in `meta.pose_validity`. Continuous tracking keeps
+the previous accepted pose and restores its estimator/Kalman seed, then retries
+on later frames. An isolated rejection leaves continuous state unchanged.
+Consumers use their existing invalid-pose fallback. The GUI displays the
+rejection reason. The synthetic-depth server's separate mask-quality diagnostic
+is unchanged.
+
+For example, change the mask acceptance threshold with
+`POSE_MIN_MASK_IOU=0.80 bash server_debug.sh`, or pass
+`--pose_min_mask_iou 0.80` directly to `server.py`. The remaining CLI options
+use the lowercase environment-variable names prefixed with `--`.
+
 FoundationPose++ is a real-time 6D pose tracker for highly dynamic scenes. 
 This project is based on [FoundationPose](https://github.com/NVlabs/FoundationPose), and consists of four main modules: FoundationPose + 2D Tracker + Kalman Filter + Amodal Completion.
 

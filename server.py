@@ -60,6 +60,8 @@ from world_calibration import (  # noqa: E402
     express_world_pose_in_camera,
     load_fixed_camera_calibrations,
 )
+from pose_validity import PoseValidityConfig, evaluate_pose_validity, is_rigid_transform  # noqa: E402
+from dev_fn.transform.transform_np import inv_transf_np  # noqa: E402
 
 _logger = logging.getLogger("object_pose_server")
 WINDOW_NAME = "object_pose_server"
@@ -367,13 +369,19 @@ class ObjectState:
     last_T_camera_object: Optional[np.ndarray] = None
     last_T_world_object: Optional[np.ndarray] = None
     last_score: Optional[float] = None
+    pose_validity: Dict[str, Any] = field(default_factory=dict)
     error_msg: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
-        return (self.state == "tracking" and self.last_T_camera_object is not None and
-                self.last_T_world_object is not None)
+        return (self.state == "tracking" and self.pose_validity.get("valid") is True and
+                is_rigid_transform(self.last_T_camera_object) and
+                is_rigid_transform(self.last_T_world_object))
+
+    @property
+    def can_track(self) -> bool:
+        return self.state == "tracking" and self.estimator is not None and self.source_camera is not None
 
     def reset_runtime(self) -> None:
         self.state = "uninitialized"
@@ -389,6 +397,7 @@ class ObjectState:
         self.last_T_camera_object = None
         self.last_T_world_object = None
         self.last_score = None
+        self.pose_validity = {}
         self.error_msg = None
         self.meta = {}
 
@@ -485,6 +494,7 @@ class ObjectPoseServer:
         background_fps: float,
         cache_size: int,
         timestamp_tolerance_ms: float,
+        pose_validity_config: Optional[PoseValidityConfig] = None,
     ):
         self.video_shape = video_shape
         self.sync_channel = sync_channel
@@ -518,6 +528,7 @@ class ObjectPoseServer:
         self.sam_api_startup_timeout = sam_api_startup_timeout
         self.display_scale = display_scale
         self.debug = debug
+        self.pose_validity_config = pose_validity_config or PoseValidityConfig()
         if not np.isfinite(display_scale) or display_scale <= 0.0:
             raise ValueError(f"display_scale must be positive and finite, got {display_scale}")
         if not np.isfinite(background_fps) or background_fps <= 0.0:
@@ -1063,6 +1074,48 @@ class ObjectPoseServer:
         state.error_msg = None
         self.ui_message = "Enter/Space: accept mask; r: redraw; c/Esc: cancel"
 
+    def _render_validation_depth(
+        self, state: ObjectState, pose_cam: np.ndarray, frame: SyncFrame,
+    ) -> np.ndarray:
+        from FoundationPose.estimater import nvdiffrast_render
+
+        estimator = state.estimator
+        camera_name = state.source_camera
+        height, width = frame.depth_by_camera[camera_name].shape
+        # FoundationPose renders its centered mesh, but returns original-mesh poses.
+        to_centered = estimator.get_tf_to_centered_mesh().detach().cpu().numpy()
+        centered_pose = np.asarray(pose_cam) @ inv_transf_np(to_centered)
+        with torch.no_grad():
+            _, rendered_depth, _ = nvdiffrast_render(
+                K=frame.cam_intr_by_camera[camera_name], H=height, W=width,
+                ob_in_cams=torch.as_tensor(
+                    centered_pose, dtype=torch.float32, device=estimator.mesh_tensors["pos"].device,
+                ).reshape(1, 4, 4),
+                glctx=estimator.glctx, mesh_tensors=estimator.mesh_tensors, extra={},
+            )
+        return rendered_depth[0].detach().cpu().numpy()
+
+    def _check_pose(
+        self, state: ObjectState, pose_cam: np.ndarray, frame: SyncFrame,
+        *, mask: Optional[np.ndarray], require_mask: bool,
+        previous_pose: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        if not is_rigid_transform(pose_cam):
+            return {"valid": False, "reason": "invalid_transform"}
+        world_pose = self.T_world_camera_map[state.source_camera] @ pose_cam
+        if not is_rigid_transform(world_pose):
+            return {"valid": False, "reason": "invalid_world_transform"}
+        try:
+            rendered_depth = self._render_validation_depth(state, pose_cam, frame)
+        except Exception as exc:
+            _logger.exception("Pose validation render failed for %s", state.spec.object_id)
+            return {"valid": False, "reason": "validation_render_failed", "error": str(exc)}
+        return evaluate_pose_validity(
+            pose_cam, frame.depth_by_camera[state.source_camera], rendered_depth,
+            config=self.pose_validity_config, tracking_mask=mask, require_mask=require_mask,
+            previous_pose=previous_pose,
+        )
+
     def _complete_initialization(self) -> bool:
         interaction = self.init_interaction
         if (interaction is None or interaction.mode != "mask" or interaction.mask is None or
@@ -1097,6 +1150,15 @@ class ObjectPoseServer:
             )
             state.source_camera = camera_name
             state.init_mask = mask
+            state.pose_validity = self._check_pose(
+                state, pose_cam, frame, mask=mask, require_mask=True,
+            )
+            if not state.pose_validity["valid"]:
+                raise ValueError(f"Pose rejected: {state.pose_validity['reason']}")
+            if state.estimator.pose_last is None:
+                raise ValueError("Registration returned no tracking seed")
+            state.last_mask = np.ascontiguousarray(mask > 0, dtype=np.uint8)
+            state.last_mask_synced_ts = float(frame.sync_timestamp)
             if self.activate_2d_tracker:
 
                 def _init_cutie_tracker():
@@ -1147,16 +1209,20 @@ class ObjectPoseServer:
             return False
 
     def _track_object(self, state: ObjectState, frame: SyncFrame) -> None:
-        if state.state != "tracking" or state.estimator is None or state.source_camera is None:
+        if not state.can_track:
             return
         camera_name = state.source_camera
         color = frame.color_by_camera.get(camera_name)
         depth = frame.depth_by_camera.get(camera_name)
         if color is None or depth is None:
+            state.pose_validity = {"valid": False, "reason": "missing_rgbd"}
             state.state = "lost"
             state.error_msg = f"Missing RGB-D frame for {camera_name}"
             return
 
+        pose_seed = state.estimator.pose_last.detach().clone()
+        kf_mean = state.kf_mean.copy() if state.kf_mean is not None else None
+        kf_covariance = state.kf_covariance.copy() if state.kf_covariance is not None else None
         try:
             cam_K = frame.cam_intr_by_camera[camera_name]
             if self.activate_2d_tracker and state.tracker_2d is not None:
@@ -1204,6 +1270,19 @@ class ObjectPoseServer:
                 K=cam_K,
                 iteration=state.spec.track_refine_iter or self.track_refine_iter,
             )
+            current_mask = (state.last_mask if state.last_mask_synced_ts == frame.sync_timestamp else None)
+            previous_reason = state.pose_validity.get("reason")
+            state.pose_validity = self._check_pose(
+                state, pose_cam, frame, mask=current_mask,
+                require_mask=self.activate_2d_tracker, previous_pose=state.last_T_camera_object,
+            )
+            if not state.pose_validity["valid"]:
+                state.estimator.pose_last = pose_seed
+                state.kf_mean, state.kf_covariance = kf_mean, kf_covariance
+                state.error_msg = f"Pose rejected: {state.pose_validity['reason']}"
+                if state.pose_validity["reason"] != previous_reason:
+                    _logger.warning("%s: %s", state.spec.object_id, state.error_msg)
+                return
             if self.activate_2d_tracker and self.activate_kalman_filter and state.kalman_filter is not None:
                 state.kf_mean, state.kf_covariance = state.kalman_filter.predict(
                     state.kf_mean,
@@ -1214,6 +1293,9 @@ class ObjectPoseServer:
             state.state = "tracking"
             state.error_msg = None
         except Exception as exc:
+            state.estimator.pose_last = pose_seed
+            state.kf_mean, state.kf_covariance = kf_mean, kf_covariance
+            state.pose_validity = {"valid": False, "reason": "tracking_error"}
             state.state = "lost"
             state.error_msg = str(exc)
             _logger.exception("Tracking failed for %s", state.spec.object_id)
@@ -1244,7 +1326,7 @@ class ObjectPoseServer:
             "T_camera_object": T_camera_object,
             "T_world_object": state.last_T_world_object,
             "valid": state.valid,
-            "state": state.state,
+            "state": "rejected" if state.state == "tracking" and not state.valid else state.state,
             "score": state.last_score,
             "source_camera": state.source_camera,
             "pose_camera": pose_camera,
@@ -1253,6 +1335,7 @@ class ObjectPoseServer:
             "tracking_mask_state": tracking_mask_state,
             "meta": {
                 **state.meta,
+                "pose_validity": dict(state.pose_validity),
                 **({
                     "error": state.error_msg
                 } if state.error_msg else {}),
@@ -1296,7 +1379,7 @@ class ObjectPoseServer:
         started = time.perf_counter()
         object_payloads: List[Dict[str, Any]] = []
         for state in self.object_states:
-            if not state.valid or state.estimator is None or state.source_camera is None:
+            if not state.can_track:
                 object_payloads.append(
                     self._state_object_payload(
                         state,
@@ -1328,23 +1411,33 @@ class ObjectPoseServer:
                 # rewind the state consumed by Cutie, Kalman, or background tracking.
                 state.estimator.pose_last = pose_last
 
-            T_observation_camera_object = np.asarray(pose_cam, dtype=np.float64)
-            T_world_object = self.T_world_camera_map[camera_name] @ T_observation_camera_object
-            pose_camera = self.expression_camera or camera_name
-            T_camera_object = (
-                T_observation_camera_object
-                if pose_camera == camera_name
-                else express_world_pose_in_camera(
-                    self.T_world_camera_map[pose_camera],
-                    T_world_object,
-                )
+            # Cutie cannot be rewound for historical requests. Validate against
+            # that frame's depth and the accepted pose; never reuse a newer mask.
+            current_mask = state.last_mask if state.last_mask_synced_ts == frame.sync_timestamp else None
+            validity = self._check_pose(
+                state, pose_cam, frame, mask=current_mask, require_mask=False,
+                previous_pose=state.last_T_camera_object,
             )
+            pose_camera = self.expression_camera or camera_name
+            T_camera_object = None
+            T_world_object = None
+            if validity["valid"]:
+                T_observation_camera_object = np.asarray(pose_cam, dtype=np.float64)
+                T_world_object = self.T_world_camera_map[camera_name] @ T_observation_camera_object
+                T_camera_object = (
+                    T_observation_camera_object
+                    if pose_camera == camera_name
+                    else express_world_pose_in_camera(
+                        self.T_world_camera_map[pose_camera],
+                        T_world_object,
+                    )
+                )
             object_payloads.append({
                 "object_id": state.spec.object_id,
                 "T_camera_object": T_camera_object,
                 "T_world_object": T_world_object,
-                "valid": True,
-                "state": "tracking",
+                "valid": validity["valid"],
+                "state": "tracking" if validity["valid"] else "rejected",
                 "score": state.last_score,
                 "source_camera": camera_name,
                 "pose_camera": pose_camera,
@@ -1352,7 +1445,8 @@ class ObjectPoseServer:
                 "tracking_mask_synced_ts": None,
                 "tracking_mask_state": "mask_unavailable_isolated",
                 "meta": {
-                    **state.meta, "request_processing": "isolated"
+                    **state.meta, "request_processing": "isolated", "pose_validity": validity,
+                    **({"error": f"Pose rejected: {validity['reason']}"} if not validity["valid"] else {}),
                 },
             })
 
@@ -1430,7 +1524,7 @@ class ObjectPoseServer:
                 details,
             )
 
-        if not any(state.valid for state in self.object_states):
+        if not any(state.can_track for state in self.object_states):
             return self._request_error(
                 "not_ready",
                 "FoundationPose++ has no initialized tracking object",
@@ -1562,6 +1656,8 @@ class ObjectPoseServer:
         for i, state in enumerate(self.object_states):
             marker = ">" if i == self.current_object_idx else " "
             text = f"{marker} {state.spec.object_id}: {state.state}"
+            if state.state == "tracking" and not state.valid:
+                text = f"{marker} {state.spec.object_id}: rejected ({state.pose_validity.get('reason', 'unchecked')})"
             color = (0, 220, 0) if state.valid else ((0, 200, 255) if state.state in ("uninitialized", "lost") else
                                                      (0, 0, 255))
             cv2.putText(disp, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -1696,7 +1792,7 @@ class ObjectPoseServer:
             _logger.info("Resetting object %s", state.spec.object_id)
             state.reset_runtime()
             self.pose_cache.clear()
-            if not any(candidate.valid for candidate in self.object_states):
+            if not any(candidate.can_track for candidate in self.object_states):
                 self.last_tracking_timestamp = None
             self.ui_message = f"Reset {state.spec.object_id}; press i to initialize"
         elif key == ord("a"):
@@ -1713,6 +1809,7 @@ class ObjectPoseServer:
 
     def run(self) -> None:
         _logger.info("Object pose server started")
+        _logger.info("Pose validity thresholds: %s", self.pose_validity_config)
         _logger.info("Subscribed to sync channel: %s", self.sync_channel)
         _logger.info("Publishing object poses on: %s", self.pub_channel)
         _logger.info("Replying to priority pose requests on: %s", self.request_channel)
@@ -1759,7 +1856,7 @@ class ObjectPoseServer:
             if now >= next_background_time:
                 background_started = now
                 frame = self.frame_cache.latest()
-                if (frame is not None and any(state.valid for state in self.object_states) and
+                if (frame is not None and any(state.can_track for state in self.object_states) and
                     (self.last_tracking_timestamp is None or
                      frame.sync_timestamp > self.last_tracking_timestamp + self.timestamp_tolerance)):
                     self.latest_frame = frame
@@ -1879,8 +1976,24 @@ def main() -> None:
     parser.add_argument("--background_fps", type=float, default=5.0)
     parser.add_argument("--cache_size", type=int, default=30)
     parser.add_argument("--timestamp_tolerance_ms", type=float, default=5.0)
+    validity_defaults = PoseValidityConfig()
+    parser.add_argument("--pose_min_mask_iou", type=float, default=validity_defaults.min_mask_iou)
+    parser.add_argument("--pose_max_depth_error_m", type=float, default=validity_defaults.max_depth_error_m)
+    parser.add_argument("--pose_min_depth_inlier_fraction", type=float,
+                        default=validity_defaults.min_depth_inlier_fraction)
+    parser.add_argument("--pose_max_translation_jump_m", type=float,
+                        default=validity_defaults.max_translation_jump_m)
+    parser.add_argument("--pose_max_rotation_jump_deg", type=float,
+                        default=validity_defaults.max_rotation_jump_deg)
     args = parser.parse_args()
 
+    pose_validity_config = PoseValidityConfig(
+        min_mask_iou=args.pose_min_mask_iou,
+        max_depth_error_m=args.pose_max_depth_error_m,
+        min_depth_inlier_fraction=args.pose_min_depth_inlier_fraction,
+        max_translation_jump_m=args.pose_max_translation_jump_m,
+        max_rotation_jump_deg=args.pose_max_rotation_jump_deg,
+    )
     object_specs = load_object_specs(args.object_config)
     server = ObjectPoseServer(
         video_shape=getattr(args, "server.video_shape"),
@@ -1910,6 +2023,7 @@ def main() -> None:
         background_fps=args.background_fps,
         cache_size=args.cache_size,
         timestamp_tolerance_ms=args.timestamp_tolerance_ms,
+        pose_validity_config=pose_validity_config,
     )
 
     def _signal_handler(signum, _frame):

@@ -3,6 +3,7 @@ import numpy as np
 import server as server_module
 from server import ObjectPoseServer, ObjectSpec, ObjectState, PosePacketCache, SyncFrame
 from world_calibration import express_world_pose_in_camera
+from pose_validity import PoseValidityConfig
 
 
 def _translation(x, y, z):
@@ -26,6 +27,8 @@ def _server_with_camera_frames(state):
     server.ui_message = None
     server.track_refine_iter = 5
     server.pose_cache = PosePacketCache(3)
+    server.pose_validity_config = PoseValidityConfig(min_pixels=1)
+    server._render_validation_depth = lambda state, _pose, frame: frame.depth_by_camera[state.source_camera]
     return server
 
 
@@ -37,6 +40,7 @@ def _tracking_state(T_lowfield_object):
         source_camera="camera_lowfield_1",
         last_T_camera_object=T_lowfield_object,
         last_T_world_object=T_world_lowfield @ T_lowfield_object,
+        pose_validity={"valid": True, "reason": "ok"},
     )
 
 
@@ -82,6 +86,7 @@ def test_top_observation_and_expression_preserve_the_estimator_pose():
         source_camera="camera_top",
         last_T_camera_object=T_top_object,
         last_T_world_object=_translation(0.5, -0.2, 0.7) @ T_top_object,
+        pose_validity={"valid": True, "reason": "ok"},
     )
     server = _server_with_camera_frames(state)
 
