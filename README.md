@@ -3,15 +3,16 @@
 ## Live server pose validity
 
 `server.py` validates registration, background tracking, and timestamped
-requests before publishing `valid=true`. The default acceptance limits are:
+requests before publishing `valid=true`. The acceptance limits for direct server
+invocation and the live launcher are:
 
-| Check | Default | `server_debug.sh` environment variable |
-| --- | --- | --- |
-| Rendered mesh / current tracking mask IoU | at least 0.40 | `POSE_MIN_MASK_IOU` |
-| Rendered / observed depth error | at most 0.02 m | `POSE_MAX_DEPTH_ERROR_M` |
-| Rendered pixels with matching observed depth | at least 70% | `POSE_MIN_DEPTH_INLIER_FRACTION` |
-| Translation from last accepted pose | at most 0.05 m | `POSE_MAX_TRANSLATION_JUMP_M` |
-| Relative rotation from last accepted pose | at most 30 degrees | `POSE_MAX_ROTATION_JUMP_DEG` |
+| Check | `server.py` default | `server_debug.sh` default | Launcher environment variable |
+| --- | --- | --- | --- |
+| Rendered mesh / current tracking mask IoU | at least 0.40 | at least 0.20 | `POSE_MIN_MASK_IOU` |
+| Rendered / observed depth error | at most 0.02 m | at most 0.04 m | `POSE_MAX_DEPTH_ERROR_M` |
+| Rendered pixels with matching observed depth | at least 70% | at least 50% | `POSE_MIN_DEPTH_INLIER_FRACTION` |
+| Translation from last accepted pose | at most 0.05 m | at most 0.05 m | `POSE_MAX_TRANSLATION_JUMP_M` |
+| Relative rotation from last accepted pose | at most 30 degrees | at most 30 degrees | `POSE_MAX_ROTATION_JUMP_DEG` |
 
 Poses must also be finite rigid transforms, with at least 64 rendered pixels
 and 64 matching depth pixels. Masks, when checked, need at least 64 foreground
