@@ -50,7 +50,9 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(THIS_DIR, "src")
 FOUNDATIONPOSE_DIR = os.path.join(THIS_DIR, "FoundationPose")
 if SRC_DIR not in sys.path:
-    sys.path.append(SRC_DIR)
+    # VOT imports this project's `utils`; the workspace also has a package
+    # with that name under retargeting_for_hand.
+    sys.path.insert(0, SRC_DIR)
 if FOUNDATIONPOSE_DIR not in sys.path:
     sys.path.append(FOUNDATIONPOSE_DIR)
 
