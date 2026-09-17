@@ -26,6 +26,7 @@ import urllib.request
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Mapping, Optional, Tuple
 
 import cv2
@@ -63,7 +64,11 @@ from world_calibration import (  # noqa: E402
     load_fixed_camera_calibrations,
 )
 from pose_validity import PoseValidityConfig, evaluate_pose_validity, is_rigid_transform  # noqa: E402
-from dev_fn.transform.transform_np import inv_transf_np  # noqa: E402
+from dev_fn.transform.transform_np import inv_transf_np, transf_point_array_np, project_point_array_np  # noqa: E402
+from model_frame_registration import (  # noqa: E402
+    apply_model_frame_offset, default_model_frame_offset_path, derive_model_frame_offset,
+    load_model_frame_offset, rotate_pose_in_object, save_model_frame_offset, translate_pose_in_object,
+)
 
 _logger = logging.getLogger("object_pose_server")
 WINDOW_NAME = "object_pose_server"
@@ -225,7 +230,11 @@ def draw_pose_frame_bgr(
     if np.any(points_cam[:, 2] <= 1e-6):
         return image_bgr
     uv = (np.asarray(K, dtype=np.float64) @ points_cam.T).T
-    uv = np.round(uv[:, :2] / uv[:, 2:3]).astype(int)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        uv = uv[:, :2] / uv[:, 2:3]
+    if not np.isfinite(uv).all() or np.any(np.abs(uv) > 1e8):
+        return image_bgr
+    uv = np.round(uv).astype(int)
     origin = tuple(uv[0].tolist())
     cv2.arrowedLine(image_bgr, origin, tuple(uv[1].tolist()), (0, 0, 255), thickness, cv2.LINE_AA, tipLength=0.08)
     cv2.arrowedLine(image_bgr, origin, tuple(uv[2].tolist()), (0, 255, 0), thickness, cv2.LINE_AA, tipLength=0.08)
@@ -351,6 +360,7 @@ class ObjectSpec:
     est_refine_iter: Optional[int] = None
     track_refine_iter: Optional[int] = None
     mask_path: Optional[str] = None
+    model_frame_offset_path: Optional[str] = None
 
 
 @dataclass
@@ -367,9 +377,12 @@ class ObjectState:
     init_mask: Optional[np.ndarray] = None
     last_mask: Optional[np.ndarray] = None
     last_mask_synced_ts: Optional[float] = None
-    # Estimator pose in source_camera; publication may express it in another camera.
+    # Raw original-mesh poses, used by tracking/validation. Apply T_fp_object
+    # only at the output boundary, never to the estimator's centered-mesh seed.
     last_T_camera_object: Optional[np.ndarray] = None
     last_T_world_object: Optional[np.ndarray] = None
+    last_accepted_frame: Optional[SyncFrame] = None
+    T_fp_object: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=np.float64))
     last_score: Optional[float] = None
     pose_validity: Dict[str, Any] = field(default_factory=dict)
     error_msg: Optional[str] = None
@@ -398,6 +411,8 @@ class ObjectState:
         self.last_mask_synced_ts = None
         self.last_T_camera_object = None
         self.last_T_world_object = None
+        self.last_accepted_frame = None
+        # T_fp_object is persistent registration, independent of tracker resets.
         self.last_score = None
         self.pose_validity = {}
         self.error_msg = None
@@ -417,6 +432,22 @@ class InitInteraction:
     bbox_xywh: Optional[Tuple[int, int, int, int]] = None
     mask: Optional[np.ndarray] = None
     mask_source: Optional[str] = None
+
+
+@dataclass
+class RegistrationInteraction:
+    """A draft pose on a retained accepted frame, independent of live tracking."""
+
+    object_idx: int
+    camera_name: str
+    frame: SyncFrame
+    T_view_fp: np.ndarray
+    initial_T_fp_object: np.ndarray
+    T_view_object: np.ndarray
+    mesh_vertices: np.ndarray
+    mesh_edges: np.ndarray
+    translation_step_m: float = 0.001
+    rotation_step_rad: float = np.deg2rad(0.5)
 
 
 class FoundationPoseFactory:
@@ -545,6 +576,7 @@ class ObjectPoseServer:
         self.pose_cache = PosePacketCache(cache_size)
 
         self.object_states = [ObjectState(spec=spec) for spec in object_specs]
+        self._load_model_frame_offsets()
         self.current_object_idx = 0
         self.latest_frame: Optional[SyncFrame] = None
         self.shutdown = False
@@ -553,6 +585,7 @@ class ObjectPoseServer:
         self.cache_thread: Optional[threading.Thread] = None
         self.last_tracking_timestamp: Optional[float] = None
         self.init_interaction: Optional[InitInteraction] = None
+        self.registration_interaction: Optional[RegistrationInteraction] = None
         # GUI view selection is independent from the RGB-D camera used to
         # initialize and track each object.
         self.selected_view_camera_by_object: Dict[int, str] = {}
@@ -588,6 +621,21 @@ class ObjectPoseServer:
         self.poller = zmq.Poller()
         self.poller.register(self.request_socket, zmq.POLLIN)
 
+    def _load_model_frame_offsets(self) -> None:
+        for state in self.object_states:
+            path = (Path(state.spec.model_frame_offset_path).expanduser()
+                    if state.spec.model_frame_offset_path else
+                    default_model_frame_offset_path(state.spec.object_id))
+            state.spec.model_frame_offset_path = str(path)
+            try:
+                state.T_fp_object, loaded = load_model_frame_offset(path)
+            except Exception as exc:
+                raise ValueError(
+                    f"Cannot load model-frame offset for {state.spec.object_id!r} from {path}: {exc}"
+                ) from exc
+            _logger.info("Model-frame offset [%s]: %s (%s)", state.spec.object_id, path,
+                         "loaded saved registration" if loaded else "no saved file; using identity")
+
     def _load_intrinsics(self) -> Dict[str, np.ndarray]:
         result: Dict[str, np.ndarray] = {}
         for camera_name in self.camera_name_list:
@@ -613,7 +661,16 @@ class ObjectPoseServer:
         state: ObjectState,
         camera_name: Optional[str],
     ) -> Optional[np.ndarray]:
-        """Express the latest tracked pose in ``camera_name`` for output or display."""
+        """Express the corrected pose in ``camera_name`` for output or display."""
+        raw_pose = self._raw_pose_for_camera(state, camera_name)
+        return None if raw_pose is None else apply_model_frame_offset(raw_pose, state.T_fp_object)
+
+    def _raw_pose_for_camera(
+        self,
+        state: ObjectState,
+        camera_name: Optional[str],
+    ) -> Optional[np.ndarray]:
+        """Express the raw original-mesh pose, including for editor snapshots."""
         if camera_name is None or state.last_T_world_object is None:
             return None
         if camera_name == state.source_camera and state.last_T_camera_object is not None:
@@ -862,7 +919,156 @@ class ObjectPoseServer:
             else:
                 self.ui_message = f"Selected initialization/view camera: {selected}"
 
+    def _start_registration_interaction(self) -> None:
+        if self.init_interaction is not None or self.registration_interaction is not None:
+            return
+        state = self.object_states[self.current_object_idx]
+        frame = state.last_accepted_frame
+        if not state.valid or not state.can_track or state.mesh is None or frame is None:
+            self.ui_message = "Model-frame adjustment needs a valid tracked pose and its accepted frame"
+            return
+        camera_name = self._preview_camera(frame)
+        if (camera_name not in frame.color_by_camera or camera_name not in frame.cam_intr_by_camera):
+            self.ui_message = "The accepted frame has no calibrated viewing camera"
+            return
+        raw_pose = self._raw_pose_for_camera(state, camera_name)
+        if raw_pose is None:
+            self.ui_message = "Cannot express the accepted pose in the viewing camera"
+            return
+        edges = np.asarray(state.mesh.edges_unique, dtype=np.int64)
+        if len(edges) > 2500:
+            edges = edges[np.linspace(0, len(edges) - 1, 2500, dtype=np.int64)]
+        self.registration_interaction = RegistrationInteraction(
+            object_idx=self.current_object_idx,
+            camera_name=camera_name,
+            frame=frame,
+            T_view_fp=raw_pose.copy(),
+            initial_T_fp_object=state.T_fp_object.copy(),
+            T_view_object=apply_model_frame_offset(raw_pose, state.T_fp_object),
+            mesh_vertices=np.asarray(state.mesh.vertices, dtype=np.float64).copy(),
+            mesh_edges=edges.copy(),
+        )
+        self.ui_message = "Editing saved model frame; Enter saves and applies, Esc discards"
+
+    def _commit_registration_interaction(self) -> None:
+        interaction = self.registration_interaction
+        if interaction is None:
+            return
+        state = self.object_states[interaction.object_idx]
+        path = state.spec.model_frame_offset_path
+        try:
+            if path is None:
+                path = str(default_model_frame_offset_path(state.spec.object_id))
+            offset = derive_model_frame_offset(interaction.T_view_fp, interaction.T_view_object)
+            save_model_frame_offset(path, offset)
+        except Exception as exc:
+            self.ui_message = f"Registration save failed: {exc}"
+            _logger.exception("Cannot save model-frame offset for %s to %s", state.spec.object_id, path)
+            return
+        # Persistence must succeed before any live output sees the draft.
+        state.spec.model_frame_offset_path = path
+        state.T_fp_object = offset
+        self.pose_cache.clear()
+        self.registration_interaction = None
+        self.ui_message = f"Saved model-frame offset: {path}"
+        _logger.info("Saved T_fp_object [%s] to %s\n%s", state.spec.object_id, path, offset)
+
+    def _cancel_registration_interaction(self) -> None:
+        self.registration_interaction = None
+        self.ui_message = "Model-frame edit discarded; saved offset retained"
+
+    def _handle_registration_key(self, key: int) -> None:
+        interaction = self.registration_interaction
+        if interaction is None:
+            return
+        if key in (13, 10):
+            self._commit_registration_interaction()
+        elif key in (27, ord("q")):
+            self._cancel_registration_interaction()
+        elif key == ord("0"):
+            interaction.T_view_object = apply_model_frame_offset(
+                interaction.T_view_fp, interaction.initial_T_fp_object,
+            )
+            self.ui_message = "Restored the model frame from the start of this edit"
+        elif key in (ord("["), ord("]")):
+            factor = 0.1 if key == ord("[") else 10.0
+            translation_step = interaction.translation_step_m * factor
+            rotation_step = interaction.rotation_step_rad * factor
+            if (np.isfinite(translation_step) and np.isfinite(rotation_step) and
+                    translation_step > 0 and rotation_step > 0):
+                interaction.translation_step_m = translation_step
+                interaction.rotation_step_rad = rotation_step
+        else:
+            translation_keys = {
+                ord("a"): (0, -1), ord("d"): (0, 1),
+                ord("w"): (1, 1), ord("s"): (1, -1),
+                ord("f"): (2, -1), ord("r"): (2, 1),
+            }
+            rotation_keys = {
+                ord("j"): (0, -1), ord("l"): (0, 1),
+                ord("i"): (1, 1), ord("k"): (1, -1),
+                ord("u"): (2, -1), ord("o"): (2, 1),
+            }
+            try:
+                if key in translation_keys:
+                    axis, direction = translation_keys[key]
+                    interaction.T_view_object = translate_pose_in_object(
+                        interaction.T_view_object, axis, direction * interaction.translation_step_m,
+                    )
+                elif key in rotation_keys:
+                    axis, direction = rotation_keys[key]
+                    interaction.T_view_object = rotate_pose_in_object(
+                        interaction.T_view_object, axis, direction * interaction.rotation_step_rad,
+                    )
+            except ValueError as exc:
+                self.ui_message = f"Adjustment rejected: {exc}"
+
+    def _draw_registration_status(self) -> None:
+        interaction = self.registration_interaction
+        if interaction is None:
+            return
+        state = self.object_states[interaction.object_idx]
+        camera_name = interaction.camera_name
+        image = cv2.cvtColor(interaction.frame.color_by_camera[camera_name].copy(), cv2.COLOR_RGB2BGR)
+        cam_K = interaction.frame.cam_intr_by_camera[camera_name]
+        points_camera = transf_point_array_np(interaction.T_view_object, interaction.mesh_vertices)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            pixels = project_point_array_np(cam_K, points_camera)
+        visible = ((points_camera[:, 2] > 1e-6) & np.isfinite(pixels).all(axis=1) &
+                   (np.abs(pixels) < 1e8).all(axis=1))
+        height, width = image.shape[:2]
+        for start_idx, end_idx in interaction.mesh_edges:
+            if not visible[start_idx] or not visible[end_idx]:
+                continue
+            start = tuple(np.round(pixels[start_idx]).astype(int).tolist())
+            end = tuple(np.round(pixels[end_idx]).astype(int).tolist())
+            intersects, start, end = cv2.clipLine((0, 0, width, height), start, end)
+            if intersects:
+                cv2.line(image, start, end, (0, 210, 255), 1, cv2.LINE_AA)
+        axis_scale = float(np.clip(np.ptp(interaction.mesh_vertices, axis=0).max() * 0.35, 0.03, 0.20))
+        draw_pose_frame_bgr(image, interaction.T_view_object, cam_K, axis_scale=axis_scale)
+        lines = [
+            f"Adjust {state.spec.object_id} | frozen view={camera_name} "
+            f"sync={interaction.frame.sync_timestamp:.3f} | live={state.state}",
+            f"step: {interaction.translation_step_m * 1000:g} mm / "
+            f"{np.rad2deg(interaction.rotation_step_rad):g} deg",
+            "move model a/d:X w/s:Y f/r:Z | rotate local j/l:X i/k:Y u/o:Z",
+            "[/]: step  0: restore  Enter: save and apply  q/Esc: discard",
+            self.ui_message or "",
+        ]
+        for index, line in enumerate(lines):
+            location = (10, 24 + 25 * index)
+            cv2.putText(image, line, location, cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(image, line, location, cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        (255, 255, 255), 1, cv2.LINE_AA)
+        if self.display_scale != 1.0:
+            image = cv2.resize(image, None, fx=self.display_scale, fy=self.display_scale)
+        cv2.imshow(WINDOW_NAME, image)
+
     def _start_init_interaction(self) -> None:
+        if self.registration_interaction is not None:
+            return
         if self.latest_frame is None:
             self.ui_message = "No synchronized frame is available for initialization"
             return
@@ -1184,6 +1390,7 @@ class ObjectPoseServer:
                 state.kf_mean, state.kf_covariance = state.kalman_filter.initiate(get_6d_pose_arr_from_mat(pose_cam))
             state.last_T_camera_object = np.asarray(pose_cam, dtype=np.float64)
             state.last_T_world_object = self.T_world_camera_map[camera_name] @ state.last_T_camera_object
+            state.last_accepted_frame = frame
             state.state = "tracking"
             state.error_msg = None
             state.meta = {
@@ -1292,6 +1499,7 @@ class ObjectPoseServer:
                 )
             state.last_T_camera_object = np.asarray(pose_cam, dtype=np.float64)
             state.last_T_world_object = self.T_world_camera_map[camera_name] @ state.last_T_camera_object
+            state.last_accepted_frame = frame
             state.state = "tracking"
             state.error_msg = None
         except Exception as exc:
@@ -1326,7 +1534,8 @@ class ObjectPoseServer:
         return {
             "object_id": state.spec.object_id,
             "T_camera_object": T_camera_object,
-            "T_world_object": state.last_T_world_object,
+            "T_world_object": (None if state.last_T_world_object is None else
+                               apply_model_frame_offset(state.last_T_world_object, state.T_fp_object)),
             "valid": state.valid,
             "state": "rejected" if state.state == "tracking" and not state.valid else state.state,
             "score": state.last_score,
@@ -1337,6 +1546,7 @@ class ObjectPoseServer:
             "tracking_mask_state": tracking_mask_state,
             "meta": {
                 **state.meta,
+                "T_fp_object": state.T_fp_object.copy(),
                 "pose_validity": dict(state.pose_validity),
                 **({
                     "error": state.error_msg
@@ -1424,7 +1634,7 @@ class ObjectPoseServer:
             T_camera_object = None
             T_world_object = None
             if validity["valid"]:
-                T_observation_camera_object = np.asarray(pose_cam, dtype=np.float64)
+                T_observation_camera_object = apply_model_frame_offset(pose_cam, state.T_fp_object)
                 T_world_object = self.T_world_camera_map[camera_name] @ T_observation_camera_object
                 T_camera_object = (
                     T_observation_camera_object
@@ -1448,6 +1658,7 @@ class ObjectPoseServer:
                 "tracking_mask_state": "mask_unavailable_isolated",
                 "meta": {
                     **state.meta, "request_processing": "isolated", "pose_validity": validity,
+                    "T_fp_object": state.T_fp_object.copy(),
                     **({"error": f"Pose rejected: {validity['reason']}"} if not validity["valid"] else {}),
                 },
             })
@@ -1566,6 +1777,9 @@ class ObjectPoseServer:
         return response
 
     def _draw_status(self, frame: SyncFrame) -> None:
+        if self.registration_interaction is not None:
+            self._draw_registration_status()
+            return
         if not frame.color_by_camera:
             return
         interaction = self.init_interaction
@@ -1666,7 +1880,7 @@ class ObjectPoseServer:
             y += 24
         y += 6
         if interaction is None:
-            controls = "[/]: object  ,/.: view  i:init  r:reset current  a:reset all  q:quit"
+            controls = "[/]: object  ,/.: view  i:init  m:model frame  r:reset  a:reset all  q:quit"
         elif interaction.mode == "roi":
             controls = "mouse drag: ROI  Enter/Space: segment  c/Esc: cancel"
         elif interaction.mode == "mask":
@@ -1734,7 +1948,10 @@ class ObjectPoseServer:
         cv2.imshow(WINDOW_NAME, disp)
 
     def _redraw_ui(self) -> None:
-        frame = self.init_interaction.frame if self.init_interaction is not None else self.latest_frame
+        if self.registration_interaction is not None:
+            frame = self.registration_interaction.frame
+        else:
+            frame = self.init_interaction.frame if self.init_interaction is not None else self.latest_frame
         if frame is None:
             self._draw_waiting_window()
         else:
@@ -1754,6 +1971,10 @@ class ObjectPoseServer:
         if key < 0:
             return
         key &= 0xFF
+        if self.registration_interaction is not None:
+            self._handle_registration_key(key)
+            self._ui_dirty = True
+            return
         interaction = self.init_interaction
         if interaction is not None:
             if interaction.mode == "roi":
@@ -1807,6 +2028,8 @@ class ObjectPoseServer:
             self.ui_message = "Reset all objects; select one and press i to initialize"
         elif key == ord("i"):
             self._start_init_interaction()
+        elif key == ord("m"):
+            self._start_registration_interaction()
         self._ui_dirty = True
 
     def run(self) -> None:
@@ -1884,6 +2107,7 @@ class ObjectPoseServer:
 
 
 def load_object_specs(path: str) -> List[ObjectSpec]:
+    config_dir = Path(path).expanduser().resolve().parent
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
     if cfg is None:
@@ -1897,6 +2121,14 @@ def load_object_specs(path: str) -> List[ObjectSpec]:
         if "object_id" not in raw or "mesh_path" not in raw:
             raise ValueError("Each object requires object_id and mesh_path")
         color = raw.get("apply_color", (0, 159, 237))
+        offset_path = raw.get("model_frame_offset_path")
+        if offset_path:
+            offset_path = Path(str(offset_path)).expanduser()
+            if not offset_path.is_absolute():
+                offset_path = config_dir / offset_path
+            offset_path = str(offset_path)
+        else:
+            offset_path = str(default_model_frame_offset_path(str(raw["object_id"])))
         specs.append(
             ObjectSpec(
                 object_id=str(raw["object_id"]),
@@ -1909,6 +2141,7 @@ def load_object_specs(path: str) -> List[ObjectSpec]:
                 track_refine_iter=raw.get("track_refine_iter"),
                 mask_path=(os.path.abspath(os.path.expanduser(str(raw["mask_path"])))
                            if raw.get("mask_path") else None),
+                model_frame_offset_path=offset_path,
             ))
     if not specs:
         raise ValueError("Object config has no objects")

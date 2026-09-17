@@ -1,5 +1,110 @@
 # FoundationPose++: Simple Tricks Boost FoundationPose Performance in High-Dynamic Scenes
 
+## Persistent manual model-frame registration
+
+The live `server.py` supports an ArUco-style model-frame correction for objects
+whose symmetry makes FoundationPose choose an unsuitable starting frame. It
+loads the latest saved correction at launch, applies it automatically after
+initialization, and lets you refine it with **m** in the existing server window.
+
+For each object, the default save location is:
+
+```text
+/home/pjlab/dex_manip/data/obj_platform_reg/<object_id>/T_fp_object.pkl
+```
+
+Override the input/save location per object in the existing `--object_config`
+YAML. Relative registration paths are resolved against that YAML's directory:
+
+```yaml
+objects:
+  - object_id: "Pipette #1"
+    mesh_path: "/home/pjlab/dex_manip/FoundationPose-plus-plus/tmp/object_model/Pipette #1/model.obj"
+    apply_scale: 1.0
+    model_frame_offset_path: "/home/pjlab/dex_manip/data/obj_platform_reg/Pipette #1/T_fp_object.pkl"
+```
+
+Existing configs can omit this field. A missing file starts from identity and
+is created on the first successful save. An existing unreadable or malformed
+file produces a startup error with the object name and path. The pickle holds
+one float64 rigid 4×4 NumPy array, `T_fp_object`; NumPy 1/2 pickle loading uses
+the same compatibility helper as ArUco registration.
+
+### Live editing and saving
+
+1. Initialize the selected object normally and wait for a valid tracked pose.
+2. Select the desired viewing camera with `,` / `.`, then press **m**.
+3. Adjust the mesh and axes against the frozen image. The image and raw pose
+   come from the same accepted frame, which may precede the latest camera image.
+4. Press **Enter** to save and apply. **Escape** or **q** discards the draft.
+
+The editor starts from the currently saved correction. Tracking and timestamped
+pose requests continue in the background with the previously saved offset while
+you edit. Every applied edit must first save successfully; if saving fails, the
+editor stays open and the active offset is retained. Each save atomically
+replaces the same file, so the next launch reads its latest value.
+
+| Keys inside the editor | Action |
+| --- | --- |
+| `a` / `d` | Corrected model's local X translation, negative / positive |
+| `w` / `s` | Corrected model's local Y translation, positive / negative |
+| `f` / `r` | Corrected model's local Z translation, negative / positive |
+| `j` / `l` | Corrected object's local X rotation, negative / positive |
+| `i` / `k` | Corrected object's local Y rotation, positive / negative |
+| `u` / `o` | Corrected object's local Z rotation, negative / positive |
+| `[` / `]` | Divide / multiply both step sizes by ten |
+| `0` | Restore the value present when this edit opened |
+| Enter | Save and apply |
+| Escape / `q` | Discard the draft and return to the live view |
+
+Initial steps are **1 mm** and **0.5 degrees**. Translation and rotation use the
+corrected model's current local axes shown in the editor. Translation follows
+any rotations made during the edit and is independent of the viewing camera.
+Object selection, camera switching, and tracker reset/init
+controls are locked during editing. Outside editing, their existing keys apply.
+The offset survives individual/all-object resets and reinitialization. Closing
+the server window discards any unfinished draft.
+
+### Transform convention and tracking behavior
+
+`P(t) = T_camera_fp` is FoundationPose's returned **original-mesh** pose, and
+`C = T_fp_object` maps corrected object coordinates into that mesh frame:
+
+```text
+corrected_pose(t) = P(t) @ C
+```
+
+Given a frozen raw pose `P0` and the manually adjusted pose `M0`, saving computes:
+
+```text
+C = inverse(P0) @ M0
+corrected_pose(t) = P(t) @ inverse(P0) @ M0
+```
+
+Thus FoundationPose supplies relative rigid motion from the manually chosen
+anchor. Rotations are composed on SO(3), and each output is computed directly
+from its raw pose and the saved offset. The offset also rotates any adjusted
+object origin correctly as the object moves.
+
+Normal publications, historical timestamp replies, and live display axes use
+the corrected pose. Existing packet fields `T_camera_object` and `T_world_object`
+carry the correction; `meta.T_fp_object` records the applied offset. A successful
+save clears the packet cache. Subsequent requests for older available frames use
+the newly saved correction; previously emitted recording samples retain their
+original values.
+
+Tracking seeds (including FoundationPose's internal centered-mesh pose), Cutie,
+Kalman state, and geometric/motion validity checks operate on raw estimates.
+Consequently `meta.pose_validity` describes raw tracking support; manual alignment
+quality is judged by the operator. A correction does not make a rejected raw
+estimate valid. Existing runtime jump rejection remains active.
+
+This layer addresses manual anchoring; it does not select symmetry-equivalent
+rotations during tracking. Reusing a file assumes the same mesh frame and scale.
+If a fresh initialization chooses a different symmetry branch, press **m** to
+adjust and save again. This workflow belongs to the live server; offline
+`src/obj_pose_track.py` processing does not load these offsets.
+
 ## Live server pose validity
 
 `server.py` validates registration, background tracking, and timestamped

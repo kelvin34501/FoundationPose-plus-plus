@@ -169,6 +169,32 @@ def test_validation_uses_observation_camera_before_expression_transform():
     assert server._state_object_payload(state)["pose_camera"] == "camera_top"
 
 
+def test_large_model_frame_correction_keeps_raw_validation_and_isolated_seed():
+    server, state, frame = _setup()
+    state.T_fp_object = np.diag([-1.0, -1.0, 1.0, 1.0])
+    state.T_fp_object[0, 3] = 0.2
+    state.estimator.result[0, 3] = 0.01
+    server._track_object(state, frame)
+    assert state.valid
+    assert state.pose_validity["rotation_jump_deg"] == pytest.approx(0.0)
+    assert state.pose_validity["translation_jump_m"] == pytest.approx(0.01)
+    np.testing.assert_array_equal(state.last_T_camera_object, state.estimator.result)
+    np.testing.assert_array_equal(state.estimator.pose_last.pose, state.estimator.result)
+    seed = state.estimator.pose_last
+    isolated = server._process_isolated_request(frame)["object_poses"][0]
+    assert isolated["valid"]
+    assert state.estimator.pose_last is seed
+
+    state.estimator.result[0, 3] = 0.3
+    isolated = server._process_isolated_request(frame)["object_poses"][0]
+    assert not isolated["valid"]
+    assert isolated["T_camera_object"] is None
+    assert state.estimator.pose_last is seed
+    server._track_object(state, frame)
+    assert not state.valid
+    assert state.pose_validity["reason"] == "translation_jump"
+
+
 def test_renderer_failure_rejects_pose(monkeypatch):
     server, state, frame = _setup()
 

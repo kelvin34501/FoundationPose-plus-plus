@@ -23,6 +23,11 @@ def _server_with_camera_frames(state):
     server.object_states = [state]
     server.current_object_idx = 0
     server.latest_frame = None
+    server.init_interaction = None
+    server.registration_interaction = None
+    server.display_scale = 1.0
+    server.shutdown = False
+    server.last_tracking_timestamp = None
     server.selected_view_camera_by_object = {}
     server.ui_message = None
     server.track_refine_iter = 5
@@ -258,3 +263,29 @@ def test_isolated_packet_uses_the_same_expression_camera():
     assert payload["pose_camera"] == "camera_top"
     np.testing.assert_allclose(payload["T_world_object"], expected_world)
     np.testing.assert_allclose(payload["T_camera_object"], expected_top)
+
+
+def test_registration_agrees_across_display_normal_and_isolated_camera_poses():
+    from dev_fn.transform.rotation_np import rotvec_to_rotmat_np
+
+    raw_pose = _translation(0.08, 0.01, 0.75)
+    raw_pose[:3, :3] = rotvec_to_rotmat_np(np.array([0.2, -0.3, 0.4]))
+    state = _tracking_state(raw_pose)
+    state.T_fp_object = _translation(0.02, -0.01, 0.03)
+    state.T_fp_object[:3, :3] = rotvec_to_rotmat_np(np.array([0.0, np.pi, 0.0]))
+    state.estimator = _Estimator(raw_pose)
+    server = _server_with_camera_frames(state)
+    server.T_world_camera_map["camera_top"][:3, :3] = rotvec_to_rotmat_np(np.array([0.6, 0.0, 0.0]))
+    expected_world = state.last_T_world_object @ state.T_fp_object
+    expected_top = express_world_pose_in_camera(server.T_world_camera_map["camera_top"], expected_world)
+    normal = server._state_object_payload(state)
+    isolated = server._process_isolated_request(_two_camera_frame())["object_poses"][0]
+    for payload in (normal, isolated):
+        assert payload["valid"]
+        np.testing.assert_allclose(payload["T_world_object"], expected_world, atol=1e-12)
+        np.testing.assert_allclose(payload["T_camera_object"], expected_top, atol=1e-12)
+        np.testing.assert_array_equal(payload["meta"]["T_fp_object"], state.T_fp_object)
+        assert not np.shares_memory(payload["meta"]["T_fp_object"], state.T_fp_object)
+    np.testing.assert_allclose(server._pose_for_camera(state, "camera_top"), expected_top, atol=1e-12)
+    np.testing.assert_allclose(server._pose_for_camera(state, state.source_camera), raw_pose @ state.T_fp_object)
+    np.testing.assert_array_equal(state.last_T_camera_object, raw_pose)
